@@ -172,4 +172,4 @@ make e2e-deps     # apt-get install smbclient
 
 ## License
 
-No license has been chosen yet. Until one is added, all rights are reserved.
+Licensed under the [Apache License, Version 2.0](LICENSE).
