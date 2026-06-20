@@ -1,0 +1,7 @@
+/gosamba
+/dist/
+*.test
+*.out
+.idea/
+.vscode/
+.*
