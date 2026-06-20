@@ -19,7 +19,9 @@ import (
 	"github.com/ahmetozer/gosamba/internal/transport"
 )
 
-const version = "0.0.0-dev"
+// version is the build version; overridden at release time via
+// -ldflags "-X main.version=...".
+var version = "0.0.0-dev"
 
 func main() {
 	if len(os.Args) > 1 {

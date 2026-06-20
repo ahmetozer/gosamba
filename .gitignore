@@ -5,3 +5,6 @@
 .idea/
 .vscode/
 .*
+!.github
+!.gitignore
+!.dockerignore
