@@ -2,13 +2,9 @@
 
 A small, dependency-light SMB file server written in pure Go.
 
-`gosamba` speaks the SMB2/SMB3 protocol directly — no `libsmbclient`, no Samba
-runtime — so it ships as a single static binary. It is designed to be easy to
-run on Linux for sharing a few directories with macOS, Windows, and iOS clients
-over the network.
-
-> **Status:** early/experimental (`0.0.0-dev`). Expect rough edges; review the
-> security notes before exposing it to untrusted networks.
+`gosamba` speaks the SMB2/SMB3 protocol directly, so it ships as a single static
+binary. It is designed to be easy to run on Linux for sharing a few directories
+with macOS, Windows, and iOS clients over the network.
 
 ## Features
 
@@ -45,17 +41,20 @@ go build -o gosamba ./cmd/gosamba
 
 ## Quick start
 
-Share a single directory for one user:
+Share a single directory for one user — no system account required:
 
 ```sh
+sudo mkdir -p /srv/files
 sudo ./gosamba \
   --share /srv/files=public \
-  --user alice:s3cret:alice
+  --user alice:s3cret
 ```
 
 This listens on `:445` (the privileged SMB port, hence `sudo`), serves
-`/srv/files` as the share `public`, and authenticates the SMB user `alice`
-(mapping to the local system user `alice`).
+`/srv/files` as the share `public`, and authenticates the SMB user `alice` with
+password `s3cret`. Because no `system_user` was given, file operations run as the
+user that launched the server (here `root`). To drop to a specific account or
+uid instead, add a third field — see [user mapping](#user-mapping).
 
 Connect from another machine:
 
@@ -129,9 +128,16 @@ guest_ok  = false
 
 [[user]]
 name         = "alice"
-nt_hash      = "..."      # 32 hex chars (16-byte NT hash)
-system_user  = "alice"
+nt_hash      = "d4c619cb16d4632b275658316a7e657e"  # 32 hex chars (16-byte NT hash)
+system_user  = "alice"    # optional: name, uid (e.g. "1000"), or uid/gid ("1000/1001")
 allow_shares = ["public"]
+```
+
+Generate an `nt_hash` from a password with the built-in `hash` subcommand:
+
+```sh
+gosamba hash                          # prompts for the password
+printf '%s' 's3cret' | gosamba hash   # or read it from stdin
 ```
 
 Run with:
