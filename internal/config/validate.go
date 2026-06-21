@@ -6,7 +6,33 @@ import (
 	"os"
 	"os/user"
 	"strconv"
+	"strings"
 )
+
+// parseNumericSystemUser interprets a system_user spec as numeric ids so the
+// uid/gid can be resolved without reading /etc/passwd.
+//
+//   - "1000"       -> uid=1000, gid=1000, ok=true
+//   - "1000/1001"  -> uid=1000, gid=1001, ok=true
+//   - "alice"      -> ok=false (it is a name; caller must look it up)
+//
+// ok=false with a nil error means the spec is a name, not a number. A non-nil
+// error means the spec looked numeric (contains '/') but was malformed.
+func parseNumericSystemUser(spec string) (uid, gid int, ok bool, err error) {
+	if u, g, hasSlash := strings.Cut(spec, "/"); hasSlash {
+		uid, uerr := strconv.Atoi(u)
+		gid, gerr := strconv.Atoi(g)
+		if uerr != nil || gerr != nil {
+			return 0, 0, false, fmt.Errorf("system_user %q: uid/gid form requires two integers", spec)
+		}
+		return uid, gid, true, nil
+	}
+	n, nerr := strconv.Atoi(spec)
+	if nerr != nil {
+		return 0, 0, false, nil // not numeric: treat as a name
+	}
+	return n, n, true, nil
+}
 
 // Validate inspects cfg, fills SystemUID/SystemGID from SystemUser, and
 // rejects invalid configurations.
@@ -59,9 +85,24 @@ func Validate(cfg *Config) error {
 		if u.Name == "" {
 			return fmt.Errorf("user[%d]: name is empty", i)
 		}
+		// No system_user: serve as the current process user, never privilege
+		// drop. Resolved without touching /etc/passwd.
 		if u.SystemUser == "" {
-			return fmt.Errorf("user %q: system_user is empty", u.Name)
+			cfg.Users[i].SystemUID = os.Getuid()
+			cfg.Users[i].SystemGID = os.Getgid()
+			continue
 		}
+		// Numeric system_user (uid or uid/gid): use the ids directly, no
+		// /etc/passwd lookup. This is what makes minimal images (e.g. scratch)
+		// work.
+		if uid, gid, ok, err := parseNumericSystemUser(u.SystemUser); err != nil {
+			return fmt.Errorf("user %q: %w", u.Name, err)
+		} else if ok {
+			cfg.Users[i].SystemUID = uid
+			cfg.Users[i].SystemGID = gid
+			continue
+		}
+		// Named system_user: resolve via /etc/passwd.
 		sysu, err := user.Lookup(u.SystemUser)
 		if err != nil {
 			return fmt.Errorf("user %q: system_user %q: %w", u.Name, u.SystemUser, err)

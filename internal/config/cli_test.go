@@ -46,10 +46,32 @@ func TestParseCLI_Repeated(t *testing.T) {
 	}
 }
 
+func TestParseCLI_TwoFieldUser(t *testing.T) {
+	got, err := ParseCLI([]string{"-u", "alice:secret"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []CLIUser{{Name: "alice", Password: "secret", SystemUser: ""}}
+	if !reflect.DeepEqual(got.Users, want) {
+		t.Errorf("users: %+v", got.Users)
+	}
+}
+
+func TestParseCLI_NumericSystemUser(t *testing.T) {
+	got, err := ParseCLI([]string{"-u", "alice:secret:1000"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Users[0].SystemUser != "1000" {
+		t.Errorf("SystemUser = %q, want %q", got.Users[0].SystemUser, "1000")
+	}
+}
+
 func TestParseCLI_BadUserFormat(t *testing.T) {
-	_, err := ParseCLI([]string{"-u", "alice:secret"})
-	if err == nil {
-		t.Fatal("expected error: -u must have 3 fields")
+	for _, spec := range []string{"alice", "a:b:c:d"} {
+		if _, err := ParseCLI([]string{"-u", spec}); err == nil {
+			t.Errorf("%q: expected error (must be 2 or 3 colon-separated fields)", spec)
+		}
 	}
 }
 

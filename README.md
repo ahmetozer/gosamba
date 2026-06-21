@@ -74,7 +74,7 @@ smbclient //your-host/public -U alice
 | Flag | Description |
 | --- | --- |
 | `-s`, `--share <path>[=<name>]` | Share a directory (repeatable). Name defaults to the basename. |
-| `-u`, `--user <smb_user>:<password>:<system_user>` | Define a user (repeatable). |
+| `-u`, `--user <smb_user>:<password>[:<system_user>]` | Define a user (repeatable). See [user mapping](#user-mapping). |
 | `-c`, `--config <file>` | Load a TOML config file. |
 | `-l`, `--listen <addr>` | Listen address (default `:445`). |
 | `--netbios` | Also bind the legacy NetBIOS port `:139`. |
@@ -87,6 +87,23 @@ smbclient //your-host/public -U alice
 | `--log-level <level>` | `debug` \| `info` \| `warn` \| `error`. |
 | `--log-format <fmt>` | `text` \| `json`. |
 | `-V`, `--version` | Print version and exit. |
+
+### User mapping
+
+The optional `system_user` field decides which OS identity a connection runs as,
+and whether `gosamba` privilege-drops:
+
+| `-u` form | Runs as | Privilege drop | Reads `/etc/passwd`? |
+| --- | --- | --- | --- |
+| `smb:pass` | the current process user | no | no |
+| `smb:pass:1000` | uid 1000, gid 1000 | yes, if uid differs from current | no |
+| `smb:pass:1000/1001` | uid 1000, gid 1001 | yes, if uid differs from current | no |
+| `smb:pass:alice` | system user `alice` | yes, if it differs from current | yes |
+
+Privilege drop only happens when the target uid differs from the current one and
+the server runs as root (per-connection, via a re-exec'd worker). Use a **numeric**
+`system_user` (or omit it) on minimal images such as the `scratch` container,
+which has no `/etc/passwd` — a **named** `system_user` requires it.
 
 ### TOML config file
 

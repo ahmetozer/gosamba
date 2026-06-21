@@ -157,14 +157,17 @@ func ParseCLI(args []string) (CLI, error) {
 	}
 	for _, u := range userSpecs {
 		parts := strings.Split(u, ":")
-		if len(parts) != 3 {
-			return CLI{}, fmt.Errorf("-u %q: must be smb_user:password:system_user (3 fields, got %d)", u, len(parts))
+		// 2 fields: smb_user:password (no privilege drop — serve as the current
+		// user). 3 fields: smb_user:password:system_user (name, numeric uid, or
+		// uid/gid).
+		if len(parts) != 2 && len(parts) != 3 {
+			return CLI{}, fmt.Errorf("-u %q: must be smb_user:password[:system_user] (2 or 3 fields, got %d)", u, len(parts))
 		}
-		out.Users = append(out.Users, CLIUser{
-			Name:       parts[0],
-			Password:   parts[1],
-			SystemUser: parts[2],
-		})
+		cu := CLIUser{Name: parts[0], Password: parts[1]}
+		if len(parts) == 3 {
+			cu.SystemUser = parts[2]
+		}
+		out.Users = append(out.Users, cu)
 	}
 
 	return out, nil
