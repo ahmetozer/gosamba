@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -17,6 +20,7 @@ import (
 	"github.com/ahmetozer/gosamba/internal/logging"
 	"github.com/ahmetozer/gosamba/internal/parent"
 	"github.com/ahmetozer/gosamba/internal/transport"
+	"github.com/ahmetozer/gosamba/internal/userdb"
 )
 
 // version is the build version; overridden at release time via
@@ -29,12 +33,49 @@ func main() {
 		case "--version", "-V":
 			fmt.Println("gosamba", version)
 			return
+		case "hash":
+			if err := runHash(os.Stdin, os.Stdout, os.Stderr); err != nil {
+				fmt.Fprintln(os.Stderr, "gosamba:", err)
+				os.Exit(1)
+			}
+			return
 		}
 	}
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "gosamba:", err)
 		os.Exit(1)
 	}
+}
+
+// runHash implements the "hash" subcommand: read a password and print its NT
+// hash (the value for a user's nt_hash). When stdin is a terminal it prompts on
+// stderr so the hash on stdout stays clean for capture/piping.
+func runHash(in *os.File, out, errOut io.Writer) error {
+	if fi, err := in.Stat(); err == nil && fi.Mode()&os.ModeCharDevice != 0 {
+		fmt.Fprint(errOut, "Password: ")
+	}
+	h, err := nthashFromReader(in)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintln(out, h)
+	return nil
+}
+
+// nthashFromReader reads a single line (one password) and returns its NT hash as
+// a 32-char hex string. A trailing CR/LF is stripped; an empty password is an
+// error.
+func nthashFromReader(r io.Reader) (string, error) {
+	line, err := bufio.NewReader(r).ReadString('\n')
+	if err != nil && err != io.EOF {
+		return "", err
+	}
+	pw := strings.TrimRight(line, "\r\n")
+	if pw == "" {
+		return "", errors.New("empty password")
+	}
+	h := userdb.NTHash(pw)
+	return hex.EncodeToString(h[:]), nil
 }
 
 func run(args []string) error {
