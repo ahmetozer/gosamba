@@ -18,10 +18,10 @@ const (
 const IoctlIsFsctl uint32 = 0x00000001
 
 type IoctlRequest struct {
-	CtlCode    uint32
-	FileID     [16]byte
+	CtlCode     uint32
+	FileID      [16]byte
 	InputBuffer []byte
-	Flags      uint32
+	Flags       uint32
 }
 
 func DecodeIoctlRequest(body []byte) (IoctlRequest, error) {

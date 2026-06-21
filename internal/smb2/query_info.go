@@ -15,40 +15,40 @@ const (
 
 // File information classes (subset).
 const (
-	FileBasicInformation       uint8 = 0x04
-	FileStandardInformation    uint8 = 0x05
-	FileInternalInformation    uint8 = 0x06
-	FileEaInformation          uint8 = 0x07
-	FileAccessInformation      uint8 = 0x08
-	FileNameInformation        uint8 = 0x09
-	FilePositionInformation    uint8 = 0x0E
-	FileFullEaInformation      uint8 = 0x0F
-	FileModeInformation        uint8 = 0x10
-	FileAlignmentInformation   uint8 = 0x11
-	FileAllInformation         uint8 = 0x12
+	FileBasicInformation         uint8 = 0x04
+	FileStandardInformation      uint8 = 0x05
+	FileInternalInformation      uint8 = 0x06
+	FileEaInformation            uint8 = 0x07
+	FileAccessInformation        uint8 = 0x08
+	FileNameInformation          uint8 = 0x09
+	FilePositionInformation      uint8 = 0x0E
+	FileFullEaInformation        uint8 = 0x0F
+	FileModeInformation          uint8 = 0x10
+	FileAlignmentInformation     uint8 = 0x11
+	FileAllInformation           uint8 = 0x12
 	FileAlternateNameInformation uint8 = 0x15
-	FileStreamInformation      uint8 = 0x16
-	FileNetworkOpenInformation uint8 = 0x22
-	FileAttributeTagInformation uint8 = 0x23
+	FileStreamInformation        uint8 = 0x16
+	FileNetworkOpenInformation   uint8 = 0x22
+	FileAttributeTagInformation  uint8 = 0x23
 )
 
 // FS information classes (subset).
 const (
-	FileFsVolumeInformation     uint8 = 0x01
-	FileFsSizeInformation       uint8 = 0x03
-	FileFsDeviceInformation     uint8 = 0x04
-	FileFsAttributeInformation  uint8 = 0x05
-	FileFsFullSizeInformation   uint8 = 0x07
+	FileFsVolumeInformation    uint8 = 0x01
+	FileFsSizeInformation      uint8 = 0x03
+	FileFsDeviceInformation    uint8 = 0x04
+	FileFsAttributeInformation uint8 = 0x05
+	FileFsFullSizeInformation  uint8 = 0x07
 )
 
 type QueryInfoRequest struct {
-	InfoType         uint8
-	FileInfoClass    uint8
-	OutputBufferLen  uint32
-	AdditionalInfo   uint32
-	Flags            uint32
-	FileID           [16]byte
-	InputBuffer      []byte
+	InfoType        uint8
+	FileInfoClass   uint8
+	OutputBufferLen uint32
+	AdditionalInfo  uint32
+	Flags           uint32
+	FileID          [16]byte
+	InputBuffer     []byte
 }
 
 func DecodeQueryInfoRequest(body []byte) (QueryInfoRequest, error) {

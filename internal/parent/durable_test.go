@@ -299,7 +299,7 @@ func TestHandleCreate_ReconnectMissingFails(t *testing.T) {
 	d, sess, _, _ := newDurableDispatcher(t, shareDir)
 
 	var dh2c [36]byte
-	dh2c[0] = 0xDE // bogus FileID
+	dh2c[0] = 0xDE  // bogus FileID
 	dh2c[16] = 0xAD // bogus CreateGuid
 	ctxs := smb2.EncodeCreateContexts([]smb2.CreateContext{{Name: tagDH2C, Data: dh2c[:]}})
 	body := buildCreateBody("z.txt", smb2.CreateDispositionOpen, 0, smb2.AccessGenericRead, ctxs)

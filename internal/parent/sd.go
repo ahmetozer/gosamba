@@ -45,8 +45,8 @@ func minimalSelfRelativeSD() []byte {
 	// SD header (20 bytes) + Owner + Group + DACL.
 	const sdHdr = 20
 	sd := make([]byte, sdHdr+len(systemSID)+len(systemSID)+aclSize)
-	sd[0] = 0x01           // Revision
-	sd[1] = 0x00           // Sbz1
+	sd[0] = 0x01                       // Revision
+	sd[1] = 0x00                       // Sbz1
 	control := uint16(0x8000 | 0x0004) // SE_SELF_RELATIVE | SE_DACL_PRESENT
 	binary.LittleEndian.PutUint16(sd[2:], control)
 	off := uint32(sdHdr)
@@ -56,7 +56,7 @@ func minimalSelfRelativeSD() []byte {
 	binary.LittleEndian.PutUint32(sd[8:], off) // Group
 	copy(sd[off:], systemSID)
 	off += uint32(len(systemSID))
-	binary.LittleEndian.PutUint32(sd[12:], 0)  // SACL
+	binary.LittleEndian.PutUint32(sd[12:], 0)   // SACL
 	binary.LittleEndian.PutUint32(sd[16:], off) // DACL
 	copy(sd[off:], dacl)
 	return sd

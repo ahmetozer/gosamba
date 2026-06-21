@@ -6,10 +6,10 @@ import (
 )
 
 type ReadRequest struct {
-	Length        uint32
-	Offset        uint64
-	FileID        [16]byte
-	MinimumCount  uint32
+	Length       uint32
+	Offset       uint64
+	FileID       [16]byte
+	MinimumCount uint32
 }
 
 func DecodeReadRequest(body []byte) (ReadRequest, error) {
@@ -38,7 +38,7 @@ func EncodeReadResponse(r ReadResponse) []byte {
 	out := make([]byte, fixed+len(r.Data))
 	binary.LittleEndian.PutUint16(out[0:], 17) // StructureSize
 	const headerSize = 64
-	out[2] = byte(headerSize + fixed)          // DataOffset (1 byte) — abs from header start
+	out[2] = byte(headerSize + fixed) // DataOffset (1 byte) — abs from header start
 	binary.LittleEndian.PutUint32(out[4:], uint32(len(r.Data)))
 	copy(out[fixed:], r.Data)
 	return out

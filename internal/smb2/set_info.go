@@ -7,11 +7,11 @@ import (
 
 // File information classes used in SET_INFO requests.
 const (
-	FileBasicInformationSet       uint8 = 0x04
-	FileRenameInformation         uint8 = 0x0A
-	FileDispositionInformation    uint8 = 0x0D
-	FileAllocationInformation     uint8 = 0x13
-	FileEndOfFileInformation      uint8 = 0x14
+	FileBasicInformationSet        uint8 = 0x04
+	FileRenameInformation          uint8 = 0x0A
+	FileDispositionInformation     uint8 = 0x0D
+	FileAllocationInformation      uint8 = 0x13
+	FileEndOfFileInformation       uint8 = 0x14
 	FileValidDataLengthInformation uint8 = 0x27
 )
 

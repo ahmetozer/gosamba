@@ -39,4 +39,3 @@ func ResolveNorm(parentDir, requestedLeaf string) (string, bool) {
 	}
 	return "", false
 }
-

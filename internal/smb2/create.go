@@ -31,19 +31,19 @@ const (
 
 // CreateDisposition values.
 const (
-	CreateDispositionSupersede    uint32 = 0
-	CreateDispositionOpen         uint32 = 1
-	CreateDispositionCreate       uint32 = 2
-	CreateDispositionOpenIf       uint32 = 3
-	CreateDispositionOverwrite    uint32 = 4
-	CreateDispositionOverwriteIf  uint32 = 5
+	CreateDispositionSupersede   uint32 = 0
+	CreateDispositionOpen        uint32 = 1
+	CreateDispositionCreate      uint32 = 2
+	CreateDispositionOpenIf      uint32 = 3
+	CreateDispositionOverwrite   uint32 = 4
+	CreateDispositionOverwriteIf uint32 = 5
 )
 
 // CreateAction values (response).
 const (
-	CreateActionSuperseded uint32 = 0
-	CreateActionOpened     uint32 = 1
-	CreateActionCreated    uint32 = 2
+	CreateActionSuperseded  uint32 = 0
+	CreateActionOpened      uint32 = 1
+	CreateActionCreated     uint32 = 2
 	CreateActionOverwritten uint32 = 3
 )
 
@@ -55,15 +55,15 @@ const (
 )
 
 type CreateRequest struct {
-	RequestedOplock     uint8
-	ImpersonationLevel  uint32
-	DesiredAccess       uint32
-	FileAttributes      uint32
-	ShareAccess         uint32
-	CreateDisposition   uint32
-	CreateOptions       uint32
-	Name                string
-	CreateContexts      []byte // raw, not parsed in v1
+	RequestedOplock    uint8
+	ImpersonationLevel uint32
+	DesiredAccess      uint32
+	FileAttributes     uint32
+	ShareAccess        uint32
+	CreateDisposition  uint32
+	CreateOptions      uint32
+	Name               string
+	CreateContexts     []byte // raw, not parsed in v1
 }
 
 func DecodeCreateRequest(body []byte) (CreateRequest, error) {

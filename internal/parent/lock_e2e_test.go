@@ -114,10 +114,11 @@ func TestLock_Baseline_NoRegression(t *testing.T) {
 // syntax and documents why it cannot directly exercise the SMB2 LOCK handler.
 //
 // smbclient syntax: open <filename>  →  returns fnum N
-//                   posix            →  enables POSIX extensions (requires server support)
-//                   lock N [r|w] <hex-offset> <hex-len>
-//                   unlock N <hex-offset> <hex-len>
-//                   close N
+//
+//	posix            →  enables POSIX extensions (requires server support)
+//	lock N [r|w] <hex-offset> <hex-len>
+//	unlock N <hex-offset> <hex-len>
+//	close N
 //
 // This test runs the "open" command only (which uses SMB2 CREATE, not LOCK) and
 // verifies it succeeds. It does NOT attempt "posix" + "lock" because gosamba

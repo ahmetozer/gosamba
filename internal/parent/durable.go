@@ -32,9 +32,9 @@ var (
 
 // Lease state bits (MS-SMB2 §2.2.13.2.8). We only ever grant READ caching.
 const (
-	leaseNone         uint32 = 0x00
-	leaseReadCaching  uint32 = 0x01
-	leaseWriteCaching uint32 = 0x02
+	leaseNone          uint32 = 0x00
+	leaseReadCaching   uint32 = 0x01
+	leaseWriteCaching  uint32 = 0x02
 	leaseHandleCaching uint32 = 0x04
 )
 
@@ -42,10 +42,10 @@ const (
 // (DH2Q or DHnQ) extracted from a CREATE's create contexts.
 type durableRequest struct {
 	present bool
-	v2      bool        // true for DH2Q, false for DHnQ
-	timeout uint32      // requested timeout in ms (v2 only; 0 for v1)
-	flags   uint32      // v2 flags (e.g. PERSISTENT)
-	guid    [16]byte    // CreateGuid (v2 only; zero for v1)
+	v2      bool     // true for DH2Q, false for DHnQ
+	timeout uint32   // requested timeout in ms (v2 only; 0 for v1)
+	flags   uint32   // v2 flags (e.g. PERSISTENT)
+	guid    [16]byte // CreateGuid (v2 only; zero for v1)
 }
 
 // durableReconnect is the parsed result of a reconnect request (DH2C or DHnC).
@@ -58,9 +58,9 @@ type durableReconnect struct {
 
 // leaseRequest is the parsed RqLs create context.
 type leaseRequest struct {
-	present  bool
-	key      [16]byte
-	state    uint32
+	present bool
+	key     [16]byte
+	state   uint32
 }
 
 // parseDurableContexts walks the raw create-context blob and extracts any

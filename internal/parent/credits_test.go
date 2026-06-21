@@ -9,10 +9,10 @@ func TestGrantCredits(t *testing.T) {
 		want   uint16
 	}{
 		// Basic floor cases
-		{0, 0, 1},   // zero charge, zero request → floor=1
-		{1, 0, 1},   // consumed 1, request 0 → floor wins → 1
-		{3, 5, 5},   // charge=3, request=5 → grant request
-		{5, 3, 5},   // charge=5 wins over request=3
+		{0, 0, 1},              // zero charge, zero request → floor=1
+		{1, 0, 1},              // consumed 1, request 0 → floor wins → 1
+		{3, 5, 5},              // charge=3, request=5 → grant request
+		{5, 3, 5},              // charge=5 wins over request=3
 		{1, 600, creditWindow}, // request capped at creditWindow (512)
 		// Charge exceeds window: grant the charge to keep balance non-negative
 		{513, 600, 513},

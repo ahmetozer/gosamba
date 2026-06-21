@@ -1,8 +1,8 @@
 package parent
 
 import (
-	"path/filepath"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/ahmetozer/gosamba/internal/smb2"

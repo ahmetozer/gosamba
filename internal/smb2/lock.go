@@ -7,27 +7,27 @@ import (
 
 // Lock flag bits (MS-SMB2 §2.2.26.1 SMB2_LOCK_ELEMENT Flags).
 const (
-	LockFlagSharedLock    uint32 = 0x00000001 // SMB2_LOCKFLAG_SHARED_LOCK
-	LockFlagExclusiveLock uint32 = 0x00000002 // SMB2_LOCKFLAG_EXCLUSIVE_LOCK
-	LockFlagUnlock        uint32 = 0x00000004 // SMB2_LOCKFLAG_UNLOCK
+	LockFlagSharedLock      uint32 = 0x00000001 // SMB2_LOCKFLAG_SHARED_LOCK
+	LockFlagExclusiveLock   uint32 = 0x00000002 // SMB2_LOCKFLAG_EXCLUSIVE_LOCK
+	LockFlagUnlock          uint32 = 0x00000004 // SMB2_LOCKFLAG_UNLOCK
 	LockFlagFailImmediately uint32 = 0x00000010 // SMB2_LOCKFLAG_FAIL_IMMEDIATELY
 )
 
 // LockElement is one entry in an SMB2 LOCK_REQUEST (MS-SMB2 §2.2.26.1).
 // Each element is 24 bytes: Offset(8)+Length(8)+Flags(4)+Reserved(4).
 type LockElement struct {
-	Offset   uint64
-	Length   uint64
-	Flags    uint32
+	Offset uint64
+	Length uint64
+	Flags  uint32
 }
 
 // LockRequest is the decoded SMB2 LOCK_REQUEST (MS-SMB2 §2.2.26).
 // StructureSize=48, LockCount(2), LockSequenceNumber/Index(4), FileId(16),
 // followed by LockCount×LockElement.
 type LockRequest struct {
-	LockSequenceIndex  uint32   // LockSequenceNumber (bits 31:4) | LockSequenceIndex (bits 3:0)
-	FileID             [16]byte
-	Locks              []LockElement
+	LockSequenceIndex uint32 // LockSequenceNumber (bits 31:4) | LockSequenceIndex (bits 3:0)
+	FileID            [16]byte
+	Locks             []LockElement
 }
 
 // DecodeLockRequest parses the body of an SMB2 LOCK request.

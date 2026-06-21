@@ -13,11 +13,11 @@ import (
 //
 // Each SMB2 LOCK_ELEMENT is mapped to a POSIX OFD lock via FcntlFlock:
 //
-//   SMB2 flag                       | fcntl type | syscall
-//   --------------------------------|------------|----------------------
-//   SMB2_LOCKFLAG_SHARED_LOCK       | F_RDLCK    | F_OFD_SETLK
-//   SMB2_LOCKFLAG_EXCLUSIVE_LOCK    | F_WRLCK    | F_OFD_SETLK
-//   SMB2_LOCKFLAG_UNLOCK            | F_UNLCK    | F_OFD_SETLK
+//	SMB2 flag                       | fcntl type | syscall
+//	--------------------------------|------------|----------------------
+//	SMB2_LOCKFLAG_SHARED_LOCK       | F_RDLCK    | F_OFD_SETLK
+//	SMB2_LOCKFLAG_EXCLUSIVE_LOCK    | F_WRLCK    | F_OFD_SETLK
+//	SMB2_LOCKFLAG_UNLOCK            | F_UNLCK    | F_OFD_SETLK
 //
 // FAIL_IMMEDIATELY (0x10) is the default for all lock operations here — we
 // always use F_OFD_SETLK (non-blocking). This is correct for a file server:

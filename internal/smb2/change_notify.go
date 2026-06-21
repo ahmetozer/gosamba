@@ -7,27 +7,27 @@ import (
 
 // CHANGE_NOTIFY filter flags (CompletionFilter).
 const (
-	NotifyFileName       uint32 = 0x00000001
-	NotifyDirName        uint32 = 0x00000002
-	NotifyAttributes     uint32 = 0x00000004
-	NotifySize           uint32 = 0x00000008
-	NotifyLastWrite      uint32 = 0x00000010
-	NotifyLastAccess     uint32 = 0x00000020
-	NotifyCreation       uint32 = 0x00000040
-	NotifyEa             uint32 = 0x00000080
-	NotifySecurity       uint32 = 0x00000100
-	NotifyStreamName     uint32 = 0x00000200
-	NotifyStreamSize     uint32 = 0x00000400
-	NotifyStreamWrite    uint32 = 0x00000800
+	NotifyFileName    uint32 = 0x00000001
+	NotifyDirName     uint32 = 0x00000002
+	NotifyAttributes  uint32 = 0x00000004
+	NotifySize        uint32 = 0x00000008
+	NotifyLastWrite   uint32 = 0x00000010
+	NotifyLastAccess  uint32 = 0x00000020
+	NotifyCreation    uint32 = 0x00000040
+	NotifyEa          uint32 = 0x00000080
+	NotifySecurity    uint32 = 0x00000100
+	NotifyStreamName  uint32 = 0x00000200
+	NotifyStreamSize  uint32 = 0x00000400
+	NotifyStreamWrite uint32 = 0x00000800
 )
 
 // FileNotifyAction values for FILE_NOTIFY_INFORMATION records.
 const (
-	FileActionAdded            uint32 = 0x00000001
-	FileActionRemoved          uint32 = 0x00000002
-	FileActionModified         uint32 = 0x00000003
-	FileActionRenamedOldName   uint32 = 0x00000004
-	FileActionRenamedNewName   uint32 = 0x00000005
+	FileActionAdded          uint32 = 0x00000001
+	FileActionRemoved        uint32 = 0x00000002
+	FileActionModified       uint32 = 0x00000003
+	FileActionRenamedOldName uint32 = 0x00000004
+	FileActionRenamedNewName uint32 = 0x00000005
 )
 
 // ChangeNotifyFlags request flags.

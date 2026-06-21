@@ -1993,4 +1993,3 @@ func (d *Dispatcher) sendAsync(rw io.ReadWriter, reqHdr smb2.Header, sess *Sessi
 	}
 	_ = d.writeFrame(rw, sess, out)
 }
-

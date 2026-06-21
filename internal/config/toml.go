@@ -198,7 +198,7 @@ func applyServerKV(f *File, key, valStr string, lineNum int) error {
 			return err
 		}
 		f.Server.PerUserPrivdrop = &b
-	// unknown keys silently ignored
+		// unknown keys silently ignored
 	}
 	return nil
 }
@@ -217,7 +217,7 @@ func applyLogKV(f *File, key, valStr string, lineNum int) error {
 			return err
 		}
 		f.Log.Format = &s
-	// unknown keys silently ignored
+		// unknown keys silently ignored
 	}
 	return nil
 }
@@ -248,7 +248,7 @@ func applyShareKV(sh *FileShare, key, valStr string, lineNum int) error {
 			return err
 		}
 		sh.GuestOK = b
-	// unknown keys silently ignored
+		// unknown keys silently ignored
 	}
 	return nil
 }
@@ -279,7 +279,7 @@ func applyUserKV(u *FileUser, key, valStr string, lineNum int) error {
 			return err
 		}
 		u.AllowShares = arr
-	// unknown keys silently ignored
+		// unknown keys silently ignored
 	}
 	return nil
 }

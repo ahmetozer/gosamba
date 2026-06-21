@@ -29,7 +29,7 @@ type Tree struct {
 // Open is a single open file/dir handle within a Session.
 type Open struct {
 	FileID        [16]byte
-	Path          string   // OS-absolute path (the base file, even for streams)
+	Path          string // OS-absolute path (the base file, even for streams)
 	IsDir         bool
 	IsPipe        bool     // virtual handle on IPC$ (srvsvc, lsarpc, etc.)
 	PipeName      string   // e.g. "srvsvc" — set on IPC$ pipe opens
@@ -64,7 +64,7 @@ type Open struct {
 	// registered in the connection's DurableTable under
 	// (DurableClientGuid, DurableCreateGuid). A clean CLOSE removes the
 	// entry; a dropped connection leaves it for reclaim until expiry.
-	IsDurable        bool
+	IsDurable         bool
 	DurableClientGuid [16]byte
 	DurableCreateGuid [16]byte
 
@@ -95,9 +95,9 @@ type Session struct {
 
 	pendingChallenge [8]byte
 
-	mu     sync.Mutex
-	trees  map[uint32]*Tree
-	opens  map[[16]byte]*Open
+	mu         sync.Mutex
+	trees      map[uint32]*Tree
+	opens      map[[16]byte]*Open
 	nextTreeID atomic.Uint32
 }
 

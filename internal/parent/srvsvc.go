@@ -20,14 +20,14 @@ const (
 	dcerpcVerMajor = 0x05
 	dcerpcVerMinor = 0x00
 
-	dcerpcPTypeRequest        = 0x00
-	dcerpcPTypeResponse       = 0x02
-	dcerpcPTypeFault          = 0x03
-	dcerpcPTypeBind           = 0x0B
-	dcerpcPTypeBindAck        = 0x0C
-	dcerpcPTypeBindNak        = 0x0D
-	dcerpcPTypeAlterContext   = 0x0E
-	dcerpcPTypeAlterCtxResp   = 0x0F
+	dcerpcPTypeRequest      = 0x00
+	dcerpcPTypeResponse     = 0x02
+	dcerpcPTypeFault        = 0x03
+	dcerpcPTypeBind         = 0x0B
+	dcerpcPTypeBindAck      = 0x0C
+	dcerpcPTypeBindNak      = 0x0D
+	dcerpcPTypeAlterContext = 0x0E
+	dcerpcPTypeAlterCtxResp = 0x0F
 
 	dcerpcPFCFirstFrag = 0x01
 	dcerpcPFCLastFrag  = 0x02
@@ -318,9 +318,9 @@ func buildNetShareEnumAllResponse(shares []config.ShareConfig) []byte {
 		return r
 	}
 
-	w32(1)          // Level
-	w32(1)          // Switch (NDR non-encapsulated-union discriminator copy)
-	w32(allocRef()) // Ctr ref ptr
+	w32(1)                    // Level
+	w32(1)                    // Switch (NDR non-encapsulated-union discriminator copy)
+	w32(allocRef())           // Ctr ref ptr
 	w32(uint32(len(entries))) // Ctr.Count
 	w32(allocRef())           // Ctr.Buffer ref ptr
 	w32(uint32(len(entries))) // MaxCount

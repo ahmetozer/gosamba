@@ -24,9 +24,9 @@ const (
 
 // advertiser holds the state for the mDNS responder.
 type advertiser struct {
-	conns    []*net.UDPConn
-	cancel   context.CancelFunc
-	wg       sync.WaitGroup
+	conns  []*net.UDPConn
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
 }
 
 // Close shuts down the advertiser and all listening sockets.

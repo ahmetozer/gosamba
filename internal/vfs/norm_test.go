@@ -122,4 +122,3 @@ func TestResolveSecureNorm_DotDotEscapeRejected(t *testing.T) {
 		t.Errorf("expected ErrTraversal, got: %v", err)
 	}
 }
-

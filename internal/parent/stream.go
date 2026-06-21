@@ -42,7 +42,7 @@ func isAFPInfoStream(name string) bool { return strings.EqualFold(name, "AFP_Afp
 // metadata stream.
 func synthAFPInfo() []byte {
 	b := make([]byte, afpInfoSize)
-	b[0], b[1], b[2], b[3] = 'A', 'F', 'P', 0x00 // afpi_Signature
+	b[0], b[1], b[2], b[3] = 'A', 'F', 'P', 0x00    // afpi_Signature
 	b[4], b[5], b[6], b[7] = 0x00, 0x00, 0x01, 0x00 // afpi_Version 0x00000100 (BE)
 	return b
 }
