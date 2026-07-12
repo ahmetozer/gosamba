@@ -12,6 +12,11 @@ requires that the built-in SMB service (File Sharing / `smbd`) isn't already
 holding the port — disable macOS File Sharing or run `gosamba` on an
 alternate port with `-l`.
 
+On macOS, the change-notify watcher opens one file descriptor per watched
+file/directory, so watching very large trees can hit the default 256
+open-file limit — raise it with `ulimit -n` if you see notify setup
+failures on a big share.
+
 ## Features
 
 - **SMB2/SMB3 dialects** — negotiates 2.0.2, 2.1, 3.0, 3.0.2, and 3.1.1.

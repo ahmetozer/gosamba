@@ -99,6 +99,10 @@ func ServeConn(ctx context.Context, c net.Conn, log *slog.Logger, maxFrame uint3
 					opts.Durable.Has(o.DurableClientGuid, o.DurableCreateGuid) {
 					return
 				}
+				// Release any byte-range locks this open held before the fd
+				// closes: releaseAll's keyFor does an Fstat on the fd, which
+				// fails (and silently no-ops) once the file is closed.
+				sharedLockManager.releaseAll(o)
 				o.File.Close()
 			})
 		})
@@ -115,7 +119,7 @@ func ServeConn(ctx context.Context, c net.Conn, log *slog.Logger, maxFrame uint3
 		Sessions: sessions,
 		Shares:   opts.Shares,
 		Log:      log,
-		locks:    newLockManager(),
+		locks:    sharedLockManager,
 	}
 
 	for {
