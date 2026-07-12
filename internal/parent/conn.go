@@ -115,6 +115,7 @@ func ServeConn(ctx context.Context, c net.Conn, log *slog.Logger, maxFrame uint3
 		Sessions: sessions,
 		Shares:   opts.Shares,
 		Log:      log,
+		locks:    newLockManager(),
 	}
 
 	for {
