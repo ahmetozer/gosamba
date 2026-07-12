@@ -6,6 +6,12 @@ A small, dependency-light SMB file server written in pure Go.
 binary. It is designed to be easy to run on Linux for sharing a few directories
 with macOS, Windows, and iOS clients over the network.
 
+It also builds and runs natively on macOS (`darwin/amd64`, `darwin/arm64`).
+Windows is not supported as a host platform. On macOS, binding `:445`
+requires that the built-in SMB service (File Sharing / `smbd`) isn't already
+holding the port — disable macOS File Sharing or run `gosamba` on an
+alternate port with `-l`.
+
 ## Features
 
 - **SMB2/SMB3 dialects** — negotiates 2.0.2, 2.1, 3.0, 3.0.2, and 3.1.1.

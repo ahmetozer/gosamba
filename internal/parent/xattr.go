@@ -52,10 +52,10 @@ func classifyXattrErr(err error) error {
 	if err == nil {
 		return nil
 	}
-	// ENODATA = "attribute does not exist" on Linux. (On BSD/macOS the same
-	// condition is ENOATTR, but on Linux ENOATTR is an alias for ENODATA and
-	// not exported by x/sys/unix, so we only test ENODATA here.)
-	if errors.Is(err, unix.ENODATA) {
+	// "Attribute does not exist" is ENODATA on Linux and ENOATTR on
+	// macOS/BSD; isXattrNotFound is build-tagged per OS to test the right
+	// errno (Linux's x/sys/unix does not export ENOATTR).
+	if isXattrNotFound(err) {
 		// Attribute not present — caller treats as empty.
 		return nil
 	}

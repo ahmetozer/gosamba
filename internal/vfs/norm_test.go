@@ -42,9 +42,12 @@ func TestResolveNorm_NFDthenNFC(t *testing.T) {
 	if !ok2 {
 		t.Error("ResolveNorm: NFC lookup for NFD-on-disk should succeed")
 	}
-	// The returned name should be the on-disk NFD name.
-	if got2 != nfdCafe {
-		t.Errorf("ResolveNorm NFC→NFD: got %q, want %q", got2, nfdCafe)
+	// The returned name should be canonically equivalent to the on-disk NFD
+	// name. On Linux the filesystem is byte-transparent so it comes back
+	// exactly as NFD; on macOS the filesystem normalizes filenames, so we
+	// compare normalization-equivalent forms rather than exact bytes.
+	if norm.NFC.String(got2) != norm.NFC.String(nfdCafe) {
+		t.Errorf("ResolveNorm NFC→NFD: got %q, want (normalization-equivalent to) %q", got2, nfdCafe)
 	}
 }
 
@@ -63,8 +66,11 @@ func TestResolveNorm_NFCthenNFD(t *testing.T) {
 	if !ok {
 		t.Error("ResolveNorm: NFD lookup for NFC-on-disk should succeed")
 	}
-	if got != nfcCafe {
-		t.Errorf("ResolveNorm NFD→NFC: got %q, want %q", got, nfcCafe)
+	// Compare normalization-equivalent forms: on macOS the filesystem
+	// normalizes filenames, so the returned name may differ byte-for-byte
+	// from nfcCafe while still being the same canonical string.
+	if norm.NFC.String(got) != norm.NFC.String(nfcCafe) {
+		t.Errorf("ResolveNorm NFD→NFC: got %q, want (normalization-equivalent to) %q", got, nfcCafe)
 	}
 }
 
