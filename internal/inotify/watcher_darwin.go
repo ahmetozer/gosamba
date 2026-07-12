@@ -33,6 +33,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 
@@ -41,16 +42,18 @@ import (
 
 // watchedDir is the per-directory bookkeeping kept while it is under watch.
 type watchedDir struct {
-	fd   int
-	path string
-	snap map[string]dirEntry
+	fd    int
+	path  string
+	token *byte // see addDir's doc comment
+	snap  map[string]dirEntry
 }
 
 // watchedFile is the per-file bookkeeping kept while a regular file is
 // individually watched.
 type watchedFile struct {
-	fd   int
-	path string
+	fd    int
+	path  string
+	token *byte // see addDir's doc comment
 }
 
 // Watcher handles kqueue-based watching for a directory tree (recursive).
@@ -131,7 +134,24 @@ func (w *Watcher) watchDir(path string) error {
 }
 
 // addDir opens path, snapshots it, and registers it with kqueue. Safe to
-// call concurrently with Watch's event loop.
+// call concurrently with Watch's event loop. It registers only path itself;
+// callers that need pre-existing children covered too (e.g. a directory
+// reactively discovered via FolderCreate/MovedTo) must use watchDir instead,
+// which walks and registers the whole subtree.
+//
+// Every registration gets a fresh, uniquely-addressed token (a lone
+// heap-allocated byte) stashed in the kevent's Udata field. Because kqueue
+// idents are just fd numbers, a closed fd can be reused by an unrelated
+// later Open (e.g. after a directory rename tears down the old watch and a
+// fresh one is opened at the new path with the same fd number). A kqueue
+// notification queued for the old registration but delivered after the new
+// one is live would otherwise be misattributed to the new entry purely by
+// ident match; comparing the delivered event's Udata pointer against the
+// current entry's token lets handleEvent detect and discard such stale
+// events instead of acting on them. The token is a genuine Go pointer (not
+// an integer smuggled through unsafe.Pointer/uintptr, which -race's checkptr
+// instrumentation rejects), and the owning watchedDir/watchedFile entry
+// keeps it reachable for as long as the registration is live.
 func (w *Watcher) addDir(path string) error {
 	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_EVTONLY, 0)
 	if err != nil {
@@ -139,13 +159,7 @@ func (w *Watcher) addDir(path string) error {
 	}
 
 	snap := scanDir(path)
-
-	kev := unix.Kevent_t{
-		Ident:  uint64(fd),
-		Filter: unix.EVFILT_VNODE,
-		Flags:  unix.EV_ADD | unix.EV_CLEAR,
-		Fflags: unix.NOTE_WRITE | unix.NOTE_DELETE | unix.NOTE_RENAME,
-	}
+	token := new(byte)
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -153,30 +167,33 @@ func (w *Watcher) addDir(path string) error {
 		unix.Close(fd)
 		return nil
 	}
+	kev := unix.Kevent_t{
+		Ident:  uint64(fd),
+		Filter: unix.EVFILT_VNODE,
+		Flags:  unix.EV_ADD | unix.EV_CLEAR,
+		Fflags: unix.NOTE_WRITE | unix.NOTE_DELETE | unix.NOTE_RENAME,
+		Udata:  token,
+	}
 	if _, err := unix.Kevent(w.kq, []unix.Kevent_t{kev}, nil, nil); err != nil {
 		unix.Close(fd)
 		return fmt.Errorf("failed to register watch for %s: %w", path, err)
 	}
-	w.dirs[fd] = &watchedDir{fd: fd, path: path, snap: snap}
+	w.dirs[fd] = &watchedDir{fd: fd, path: path, token: token, snap: snap}
 	w.pathToFd[path] = fd
 	return nil
 }
 
 // addFile opens path and registers it with kqueue so in-place writes to an
 // already-existing file (which do not touch its parent directory's own
-// NOTE_WRITE) are still observed.
+// NOTE_WRITE) are still observed. See addDir's doc comment for why every
+// registration carries a fresh generation token.
 func (w *Watcher) addFile(path string) error {
 	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_EVTONLY, 0)
 	if err != nil {
 		return fmt.Errorf("failed to open %s: %w", path, err)
 	}
 
-	kev := unix.Kevent_t{
-		Ident:  uint64(fd),
-		Filter: unix.EVFILT_VNODE,
-		Flags:  unix.EV_ADD | unix.EV_CLEAR,
-		Fflags: unix.NOTE_WRITE | unix.NOTE_EXTEND | unix.NOTE_DELETE | unix.NOTE_RENAME,
-	}
+	token := new(byte)
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -184,27 +201,20 @@ func (w *Watcher) addFile(path string) error {
 		unix.Close(fd)
 		return nil
 	}
+	kev := unix.Kevent_t{
+		Ident:  uint64(fd),
+		Filter: unix.EVFILT_VNODE,
+		Flags:  unix.EV_ADD | unix.EV_CLEAR,
+		Fflags: unix.NOTE_WRITE | unix.NOTE_EXTEND | unix.NOTE_DELETE | unix.NOTE_RENAME,
+		Udata:  token,
+	}
 	if _, err := unix.Kevent(w.kq, []unix.Kevent_t{kev}, nil, nil); err != nil {
 		unix.Close(fd)
 		return fmt.Errorf("failed to register watch for %s: %w", path, err)
 	}
-	w.files[fd] = &watchedFile{fd: fd, path: path}
+	w.files[fd] = &watchedFile{fd: fd, path: path, token: token}
 	w.filePathToFd[path] = fd
 	return nil
-}
-
-// removeDirByPath drops and closes the watch registered at path, if any.
-func (w *Watcher) removeDirByPath(path string) {
-	w.mu.Lock()
-	fd, ok := w.pathToFd[path]
-	if ok {
-		delete(w.pathToFd, path)
-		delete(w.dirs, fd)
-	}
-	w.mu.Unlock()
-	if ok {
-		unix.Close(fd)
-	}
 }
 
 // removeFileByPath drops and closes the file watch registered at path, if any.
@@ -217,6 +227,39 @@ func (w *Watcher) removeFileByPath(path string) {
 	}
 	w.mu.Unlock()
 	if ok {
+		unix.Close(fd)
+	}
+}
+
+// removeSubtree drops and closes every dir/file watch rooted at prefix: the
+// entry at prefix itself plus every entry whose path is nested under it.
+// Used both when a watched directory is itself deleted/renamed away (its own
+// vnode notification only tells us the ident is gone, not what replaced it)
+// and when the caller is about to fully re-walk and re-register a subtree
+// from scratch (e.g. re-pathing after a rename) and wants a clean slate
+// first. Removing every descendant from the maps before closing any fd
+// ensures each fd is closed exactly once, even though prefix's own dir watch
+// and its descendants' dir/file watches are torn down together here.
+func (w *Watcher) removeSubtree(prefix string) {
+	nested := prefix + string(filepath.Separator)
+	w.mu.Lock()
+	var fds []int
+	for path, fd := range w.pathToFd {
+		if path == prefix || strings.HasPrefix(path, nested) {
+			delete(w.pathToFd, path)
+			delete(w.dirs, fd)
+			fds = append(fds, fd)
+		}
+	}
+	for path, fd := range w.filePathToFd {
+		if path == prefix || strings.HasPrefix(path, nested) {
+			delete(w.filePathToFd, path)
+			delete(w.files, fd)
+			fds = append(fds, fd)
+		}
+	}
+	w.mu.Unlock()
+	for _, fd := range fds {
 		unix.Close(fd)
 	}
 }
@@ -292,7 +335,11 @@ func (w *Watcher) Watch() error {
 }
 
 // handleEvent routes one kqueue notification to the directory or file
-// handler, based on which watch set its ident (fd) belongs to.
+// handler, based on which watch set its ident (fd) belongs to. Events whose
+// Udata token doesn't match the current registration at that ident are
+// stale — the fd number was reused by a later, unrelated registration after
+// this event was queued but before it was delivered — and are discarded
+// rather than misattributed to the new entry. See addDir's doc comment.
 func (w *Watcher) handleEvent(kev unix.Kevent_t) {
 	fd := int(kev.Ident)
 	w.mu.Lock()
@@ -302,8 +349,16 @@ func (w *Watcher) handleEvent(kev unix.Kevent_t) {
 
 	switch {
 	case isDir:
+		if dir.token != kev.Udata {
+			slog.Debug("inotify stale event ignored", "path", dir.path, "fd", fd)
+			return
+		}
 		w.handleDirEvent(dir, kev)
 	case isFile:
+		if file.token != kev.Udata {
+			slog.Debug("inotify stale event ignored", "path", file.path, "fd", fd)
+			return
+		}
 		w.handleFileEvent(file, kev)
 	}
 }
@@ -314,7 +369,14 @@ func (w *Watcher) handleEvent(kev unix.Kevent_t) {
 // subdirectories that appeared or disappeared.
 func (w *Watcher) handleDirEvent(dir *watchedDir, kev unix.Kevent_t) {
 	if kev.Fflags&(unix.NOTE_DELETE|unix.NOTE_RENAME) != 0 {
-		w.removeDirByPath(dir.path)
+		// The vnode itself was removed or renamed away. We don't know its
+		// new path (if any) from this notification alone — that comes from
+		// the parent directory's own diff pass (Delete/MovedFrom below, or
+		// FolderCreate/MovedTo re-registering the new path). Tear down the
+		// whole old subtree now so a reused fd number can't later be
+		// misattributed to a freshly registered entry, and so we don't leak
+		// the fds of any descendants that were watched under this path.
+		w.removeSubtree(dir.path)
 		return
 	}
 
@@ -340,8 +402,12 @@ func (w *Watcher) handleDirEvent(dir *watchedDir, kev unix.Kevent_t) {
 		name := filepath.Base(ev.Path)
 		switch ev.Event {
 		case FolderCreate:
-			if err := w.addDir(ev.Path); err != nil {
-				slog.Debug("inotify addDir", "path", ev.Path, "err", err)
+			// Recursive: a directory can appear already populated (e.g. a
+			// rename within the tree, or an mv of a populated directory
+			// into the share), so walk it and register every pre-existing
+			// file and subdirectory too, not just the directory itself.
+			if err := w.watchDir(ev.Path); err != nil {
+				slog.Debug("inotify watchDir", "path", ev.Path, "err", err)
 			}
 		case FileCreate:
 			if err := w.addFile(ev.Path); err != nil {
@@ -351,7 +417,11 @@ func (w *Watcher) handleDirEvent(dir *watchedDir, kev unix.Kevent_t) {
 			if e, ok := newSnap[name]; ok {
 				var err error
 				if e.isDir {
-					err = w.addDir(ev.Path)
+					// Same reasoning as FolderCreate: re-register the whole
+					// subtree at its new path so pre-existing children stay
+					// watched and stored paths are refreshed (fixes stale
+					// watchedFile.path after an ancestor rename).
+					err = w.watchDir(ev.Path)
 				} else {
 					err = w.addFile(ev.Path)
 				}
@@ -362,7 +432,7 @@ func (w *Watcher) handleDirEvent(dir *watchedDir, kev unix.Kevent_t) {
 		case Delete, MovedFrom:
 			if e, ok := oldSnap[name]; ok {
 				if e.isDir {
-					w.removeDirByPath(ev.Path)
+					w.removeSubtree(ev.Path)
 				} else {
 					w.removeFileByPath(ev.Path)
 				}
