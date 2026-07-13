@@ -10,7 +10,10 @@ permissions:
 jobs:
   test:
     name: Test & Build
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
@@ -21,6 +24,7 @@ jobs:
           cache: true
 
       - name: Install e2e dependencies
+        if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y smbclient
 
       - name: Verify formatting

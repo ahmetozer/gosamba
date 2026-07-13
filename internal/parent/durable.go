@@ -214,8 +214,13 @@ func (t *DurableTable) Reclaim(clientGuid, createGuid [16]byte) (*Open, bool) {
 	}
 	delete(t.entries, k)
 	if time.Now().After(e.deadline) {
-		// Lazy eviction: close the fd so we don't leak it.
+		// Lazy eviction: close the fd so we don't leak it. On darwin, locks
+		// held by this open do not survive durable expiry (unlike linux OFD
+		// locks, which the kernel releases automatically on close anyway) —
+		// release the in-process ranges before closing so the global lock
+		// table doesn't leak entries for a file we'll never touch again.
 		if e.open != nil && e.open.File != nil {
+			sharedLockManager.releaseAll(e.open)
 			e.open.File.Close()
 		}
 		return nil, false
@@ -240,8 +245,10 @@ func (t *DurableTable) ReclaimForShare(clientGuid, createGuid [16]byte, shareNam
 		return nil, false
 	}
 	if time.Now().After(e.deadline) {
-		// Lazy eviction: close the fd so we don't leak it.
+		// Lazy eviction: close the fd so we don't leak it. Release ranges
+		// first (see the equivalent comment in Reclaim above).
 		if e.open != nil && e.open.File != nil {
+			sharedLockManager.releaseAll(e.open)
 			e.open.File.Close()
 		}
 		delete(t.entries, k)
@@ -317,7 +324,9 @@ func (t *DurableTable) Expire(now time.Time) int {
 	n := 0
 	for k, e := range t.entries {
 		if now.After(e.deadline) {
+			// Release ranges first (see the equivalent comment in Reclaim).
 			if e.open != nil && e.open.File != nil {
+				sharedLockManager.releaseAll(e.open)
 				e.open.File.Close()
 			}
 			delete(t.entries, k)
@@ -362,8 +371,13 @@ func (d *Dispatcher) handleDurableReconnect(rw io.ReadWriter, hdr smb2.Header, s
 	// above already enforced this; saved is non-nil only when shares matched.
 
 	// The saved descriptor belonged to the dropped connection; close it so we
-	// don't leak the fd, then re-open fresh below.
+	// don't leak the fd, then re-open fresh below. Release its byte-range
+	// locks first: on darwin, locks do not survive a durable reclaim (unlike
+	// linux OFD locks, which live in the kernel and are unaffected by which
+	// *os.File we're using); this is an accepted darwin limitation. Doing
+	// this also prevents the global lock table from leaking entries.
 	if saved.File != nil {
+		sharedLockManager.releaseAll(saved)
 		saved.File.Close()
 	}
 

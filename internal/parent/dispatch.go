@@ -30,6 +30,9 @@ type Dispatcher struct {
 	Shares   []config.ShareConfig
 	Log      *slog.Logger
 
+	// locks is the per-OS byte-range lock manager backing handleLock/handleClose.
+	locks *lockManager
+
 	// Chain state — set by handleCreate, consumed by the ServeConn loop
 	// to satisfy "previous handle" FileIDs in compound related ops.
 	LastCreatedFileID [16]byte
@@ -1083,6 +1086,9 @@ func (d *Dispatcher) handleClose(rw io.ReadWriter, hdr smb2.Header, body []byte,
 		d.Conn.Durable.Remove(open.DurableClientGuid, open.DurableCreateGuid)
 	}
 	if open.File != nil {
+		if d.locks != nil {
+			d.locks.releaseAll(open)
+		}
 		open.File.Close()
 	}
 	if open.IsPipe {

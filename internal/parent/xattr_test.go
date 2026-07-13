@@ -96,8 +96,8 @@ func TestXattr_StreamRoundTrip(t *testing.T) {
 	if err := removeStreamXattr(path, "mystream"); err != nil {
 		t.Fatalf("removeStreamXattr: %v", err)
 	}
-	if _, err := unix.Getxattr(path, "user.gosamba.ads.mystream", raw); !errors.Is(err, unix.ENODATA) {
-		t.Fatalf("after remove, expected ENODATA, got %v", err)
+	if _, err := unix.Getxattr(path, "user.gosamba.ads.mystream", raw); !isXattrNotFound(err) {
+		t.Fatalf("after remove, expected attribute-not-found, got %v", err)
 	}
 	// Removing a missing stream is not an error.
 	if err := removeStreamXattr(path, "mystream"); err != nil {
@@ -246,8 +246,8 @@ func TestStream_DeleteOnClose(t *testing.T) {
 	d.handleClose(rw, smb2.Header{Command: smb2.CommandClose}, buildCloseBody(open.FileID), sess)
 
 	raw := make([]byte, 16)
-	if _, err := unix.Getxattr(base, "user.gosamba.ads.gone", raw); !errors.Is(err, unix.ENODATA) {
-		t.Fatalf("expected ENODATA after delete-on-close, got %v", err)
+	if _, err := unix.Getxattr(base, "user.gosamba.ads.gone", raw); !isXattrNotFound(err) {
+		t.Fatalf("expected attribute-not-found after delete-on-close, got %v", err)
 	}
 }
 

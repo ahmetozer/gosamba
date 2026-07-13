@@ -12,24 +12,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-type EventType uint8
-
-const (
-	FolderCreate EventType = iota
-	FileCreate
-	Delete
-	Modified
-	MovedFrom
-	MovedTo
-	WatchStop
-)
-
 const inotifyEventBaseSize = 16
-
-type InotifyEvent struct {
-	Path  string
-	Event EventType
-}
 
 type systemInotifyEvent struct {
 	Wd     int32

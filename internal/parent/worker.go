@@ -97,35 +97,6 @@ func dropPrivileges(uid, gid int, groups []int) error {
 	return applyPrivDrop(plan)
 }
 
-// applyPrivDrop performs the syscalls described by plan. Separated from
-// decidePrivDrop so the decision can be tested without the destructive calls.
-func applyPrivDrop(plan privDropPlan) error {
-	if !plan.Drop {
-		return nil
-	}
-	// Supplementary groups first (requires privilege; lost after uid drop).
-	g := plan.Groups
-	if g == nil {
-		g = []int{plan.GID}
-	}
-	if err := syscall.Setgroups(g); err != nil {
-		return fmt.Errorf("setgroups %v: %w", g, err)
-	}
-	// gid before uid; set saved-gid too.
-	if err := syscall.Setresgid(plan.GID, plan.GID, plan.GID); err != nil {
-		return fmt.Errorf("setresgid %d: %w", plan.GID, err)
-	}
-	// uid last; set saved-uid too so root cannot be regained.
-	if err := syscall.Setresuid(plan.UID, plan.UID, plan.UID); err != nil {
-		return fmt.Errorf("setresuid %d: %w", plan.UID, err)
-	}
-	// Verify the drop actually stuck — defence in depth.
-	if syscall.Geteuid() != plan.UID {
-		return fmt.Errorf("privilege drop verification failed: euid=%d want=%d", syscall.Geteuid(), plan.UID)
-	}
-	return nil
-}
-
 // ShouldUsePrivdropWorker reports whether the listener should serve connections
 // via re-exec workers. It is pure (decision uses the supplied euid) so the
 // gating can be unit-tested.
