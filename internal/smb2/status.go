@@ -32,5 +32,9 @@ const (
 	StatusNetworkNameDeleted  Status = 0xC00000C9
 	StatusBufferOverflow      Status = 0x80000005
 	StatusLockNotGranted      Status = 0xC0000055
+	StatusFileLockConflict    Status = 0xC0000054
 	StatusDiskFull            Status = 0xC000007F
+	// StatusInsufficientResources is what a server returns when it refuses to
+	// allocate more per-session state (handles, trees) for a client.
+	StatusInsufficientResources Status = 0xC000009A
 )

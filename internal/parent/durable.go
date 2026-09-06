@@ -162,9 +162,29 @@ type durableKey struct {
 // durableEntry is a reclaimable open kept alive past its Connection's death
 // until the deadline expires.
 type durableEntry struct {
-	open      *Open
-	deadline  time.Time
+	open *Open
+	// deadline is the instant this entry stops being reclaimable. It is only
+	// meaningful once the entry is detached: while the owning connection is
+	// still alive the entry is ATTACHED and deadline is the zero time, meaning
+	// "not counting down". Starting the clock at CREATE instead would let the
+	// sweeper close the fd of a handle a live client is still using.
+	deadline time.Time
+	// timeout is how long the entry stays reclaimable after it detaches.
+	timeout   time.Duration
 	shareName string // original share name; reconnect must arrive on same share
+	// userName is the SMB user that opened the handle. A reconnect from a
+	// different principal must not be able to take it over (MS-SMB2 §3.3.5.9.7
+	// requires the reclaim to be made by the same security context).
+	userName string
+}
+
+// attached reports whether the entry still belongs to a live connection, in
+// which case it never expires.
+func (e *durableEntry) attached() bool { return e.deadline.IsZero() }
+
+// expired reports whether a detached entry is past its deadline.
+func (e *durableEntry) expired(now time.Time) bool {
+	return !e.attached() && now.After(e.deadline)
 }
 
 // DurableTable holds durable opens keyed by (ClientGuid, CreateGuid). It is
@@ -181,10 +201,12 @@ func NewDurableTable() *DurableTable {
 	return &DurableTable{entries: make(map[durableKey]*durableEntry)}
 }
 
-// Register records an open as durable, reclaimable until now+timeout. The
-// shareName is stored and checked on reclaim (MS-SMB2 §3.3.5.9.7). A zero or
-// negative timeout removes any existing entry (treated as non-durable).
-func (t *DurableTable) Register(clientGuid, createGuid [16]byte, open *Open, timeout time.Duration, shareName string) {
+// Register records an open as durable. The entry starts ATTACHED: it belongs
+// to a live connection and does not expire. Detach starts the timeout when that
+// connection drops. The shareName and userName are stored and checked on
+// reclaim (MS-SMB2 §3.3.5.9.7). A zero or negative timeout removes any existing
+// entry (treated as non-durable).
+func (t *DurableTable) Register(clientGuid, createGuid [16]byte, open *Open, timeout time.Duration, shareName, userName string) {
 	if t == nil {
 		return
 	}
@@ -195,7 +217,29 @@ func (t *DurableTable) Register(clientGuid, createGuid [16]byte, open *Open, tim
 		delete(t.entries, k)
 		return
 	}
-	t.entries[k] = &durableEntry{open: open, deadline: time.Now().Add(timeout), shareName: shareName}
+	t.entries[k] = &durableEntry{
+		open:      open,
+		timeout:   timeout,
+		shareName: shareName,
+		userName:  userName,
+	}
+}
+
+// Detach marks an entry as no longer owned by a live connection and starts its
+// reclaim countdown. Called during connection teardown; entries left attached
+// would never expire, and entries expired from CREATE time would have their fd
+// closed while still in use.
+func (t *DurableTable) Detach(clientGuid, createGuid [16]byte) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	e, ok := t.entries[durableKey{clientGuid: clientGuid, createGuid: createGuid}]
+	if !ok || !e.attached() {
+		return
+	}
+	e.deadline = time.Now().Add(e.timeout)
 }
 
 // Reclaim returns the live open for (clientGuid, createGuid) and removes it from
@@ -213,7 +257,7 @@ func (t *DurableTable) Reclaim(clientGuid, createGuid [16]byte) (*Open, bool) {
 		return nil, false
 	}
 	delete(t.entries, k)
-	if time.Now().After(e.deadline) {
+	if e.expired(time.Now()) {
 		// Lazy eviction: close the fd so we don't leak it. On darwin, locks
 		// held by this open do not survive durable expiry (unlike linux OFD
 		// locks, which the kernel releases automatically on close anyway) —
@@ -233,7 +277,7 @@ func (t *DurableTable) Reclaim(clientGuid, createGuid [16]byte) (*Open, bool) {
 // the share name does not match, it returns ok=false without consuming the
 // entry (leaving it available for a correctly-targeted reconnect attempt or
 // expiry sweep).
-func (t *DurableTable) ReclaimForShare(clientGuid, createGuid [16]byte, shareName string) (*Open, bool) {
+func (t *DurableTable) ReclaimForShare(clientGuid, createGuid [16]byte, shareName, userName string) (*Open, bool) {
 	if t == nil {
 		return nil, false
 	}
@@ -244,7 +288,7 @@ func (t *DurableTable) ReclaimForShare(clientGuid, createGuid [16]byte, shareNam
 	if !ok {
 		return nil, false
 	}
-	if time.Now().After(e.deadline) {
+	if e.expired(time.Now()) {
 		// Lazy eviction: close the fd so we don't leak it. Release ranges
 		// first (see the equivalent comment in Reclaim above).
 		if e.open != nil && e.open.File != nil {
@@ -256,6 +300,13 @@ func (t *DurableTable) ReclaimForShare(clientGuid, createGuid [16]byte, shareNam
 	}
 	// Share mismatch: reject without consuming the entry.
 	if e.shareName != shareName {
+		return nil, false
+	}
+	// Identity mismatch: a durable handle may only be reclaimed by the same
+	// SMB user that opened it. Without this a second authenticated user who
+	// learned the (ClientGuid, CreateGuid) pair could adopt another user's
+	// open file handle, inheriting its granted access.
+	if e.userName != userName {
 		return nil, false
 	}
 	delete(t.entries, k)
@@ -277,7 +328,7 @@ func (t *DurableTable) Has(clientGuid, createGuid [16]byte) bool {
 	if !ok {
 		return false
 	}
-	return !time.Now().After(e.deadline)
+	return !e.expired(time.Now())
 }
 
 // StartSweeper launches a background goroutine that calls Expire at regular
@@ -323,7 +374,7 @@ func (t *DurableTable) Expire(now time.Time) int {
 	defer t.mu.Unlock()
 	n := 0
 	for k, e := range t.entries {
-		if now.After(e.deadline) {
+		if e.expired(now) {
 			// Release ranges first (see the equivalent comment in Reclaim).
 			if e.open != nil && e.open.File != nil {
 				sharedLockManager.releaseAll(e.open)
@@ -362,7 +413,7 @@ func (d *Dispatcher) handleDurableReconnect(rw io.ReadWriter, hdr smb2.Header, s
 	if d.Conn == nil || d.Conn.Durable == nil {
 		return false
 	}
-	saved, ok := d.Conn.Durable.ReclaimForShare(d.Conn.ClientGuid, durableLookupKey(rec), tree.Share.Name)
+	saved, ok := d.Conn.Durable.ReclaimForShare(d.Conn.ClientGuid, durableLookupKey(rec), tree.Share.Name, sess.User.Name)
 	if !ok {
 		return false
 	}
@@ -414,7 +465,7 @@ func (d *Dispatcher) handleDurableReconnect(rw io.ReadWriter, hdr smb2.Header, s
 
 	sess.AddOpen(open)
 	// Re-register so a subsequent drop can reclaim again.
-	d.Conn.Durable.Register(open.DurableClientGuid, open.DurableCreateGuid, open, d.Conn.DurableTimeout, tree.Share.Name)
+	d.Conn.Durable.Register(open.DurableClientGuid, open.DurableCreateGuid, open, d.Conn.DurableTimeout, tree.Share.Name, sess.User.Name)
 	d.LastCreatedFileID = open.FileID
 	d.HasLastCreated = true
 
@@ -462,7 +513,7 @@ func (d *Dispatcher) handleDurableReconnect(rw io.ReadWriter, hdr smb2.Header, s
 // applyDurableAndLease registers a fresh durable open (DH2Q/DHnQ) and appends
 // the matching response contexts plus an RqLs lease grant to baseCtxs. The
 // returned blob is the full, re-encoded create-context list for the response.
-func (d *Dispatcher) applyDurableAndLease(open *Open, dq durableRequest, lr leaseRequest, baseCtxs []byte) []byte {
+func (d *Dispatcher) applyDurableAndLease(open *Open, dq durableRequest, lr leaseRequest, baseCtxs []byte, userName string) []byte {
 	// Decode the AAPL/MxAc contexts already built so we can append to them.
 	var ctxs []smb2.CreateContext
 	if len(baseCtxs) > 0 {
@@ -496,7 +547,7 @@ func (d *Dispatcher) applyDurableAndLease(open *Open, dq durableRequest, lr leas
 		if open.Tree != nil {
 			shareName = open.Tree.Share.Name
 		}
-		d.Conn.Durable.Register(open.DurableClientGuid, open.DurableCreateGuid, open, timeout, shareName)
+		d.Conn.Durable.Register(open.DurableClientGuid, open.DurableCreateGuid, open, timeout, shareName, userName)
 
 		if dq.v2 {
 			ctxs = append(ctxs, smb2.CreateContext{

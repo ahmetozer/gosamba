@@ -3,6 +3,7 @@ package parent
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/binary"
 	"io"
 	"log/slog"
@@ -13,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ahmetozer/gosamba/internal/config"
 	"github.com/ahmetozer/gosamba/internal/smb2"
 	"github.com/ahmetozer/gosamba/internal/transport"
 )
@@ -216,5 +218,276 @@ func TestHardening_GotEncryptedRaceSafe(t *testing.T) {
 	wg.Wait()
 	if !sess.GotEncrypted() {
 		t.Errorf("GotEncrypted should be latched true")
+	}
+}
+
+// TestHardening_LockRangeOverflow proves a lock-to-EOF range (huge length) is
+// compared without wrapping. Before the fix start+length overflowed to a small
+// number, so two conflicting exclusive locks were both granted.
+func TestHardening_LockRangeOverflow(t *testing.T) {
+	const maxLen = ^uint64(0)
+	if !rangesOverlap(0, maxLen, 1<<40, 1) {
+		t.Errorf("lock-to-EOF from 0 should cover offset 2^40")
+	}
+	if !rangesOverlap(100, maxLen, 100, maxLen) {
+		t.Errorf("two lock-to-EOF ranges at the same offset must overlap")
+	}
+	if rangesOverlap(0, 10, 10, 5) {
+		t.Errorf("adjacent ranges must not overlap")
+	}
+	if rangesOverlap(0, 0, 0, 10) {
+		t.Errorf("a zero-length range covers no bytes")
+	}
+	if got := rangeEnd(^uint64(0)-1, 100); got != ^uint64(0) {
+		t.Errorf("rangeEnd saturated to %d, want max uint64", got)
+	}
+}
+
+// TestHardening_LockConflictBlocksIO proves an exclusive lock held by one
+// handle makes another handle's overlapping read and write fail, rather than
+// silently succeeding as before.
+func TestHardening_LockConflictBlocksIO(t *testing.T) {
+	tbl := newRangeTable()
+	key := fileKey{dev: 1, ino: 2}
+	holder := &Open{Path: "/x"}
+	other := &Open{Path: "/x"}
+
+	if err := tbl.apply(key, holder, 0, 100, lockExclusive); err != nil {
+		t.Fatalf("exclusive lock: %v", err)
+	}
+	if !tbl.conflict(key, other, 50, 10, false) {
+		t.Errorf("read overlapping an exclusive lock should conflict")
+	}
+	if !tbl.conflict(key, other, 50, 10, true) {
+		t.Errorf("write overlapping an exclusive lock should conflict")
+	}
+	if tbl.conflict(key, holder, 50, 10, true) {
+		t.Errorf("the lock holder's own I/O must not conflict")
+	}
+	if tbl.conflict(key, other, 200, 10, true) {
+		t.Errorf("I/O outside the locked range must not conflict")
+	}
+
+	// A shared lock blocks writes but not reads.
+	tbl.releaseOwner(key, holder)
+	if err := tbl.apply(key, holder, 0, 100, lockShared); err != nil {
+		t.Fatalf("shared lock: %v", err)
+	}
+	if tbl.conflict(key, other, 10, 5, false) {
+		t.Errorf("read overlapping a shared lock must be allowed")
+	}
+	if !tbl.conflict(key, other, 10, 5, true) {
+		t.Errorf("write overlapping a shared lock must conflict")
+	}
+}
+
+// TestHardening_DurableAttachedNeverExpires proves the sweeper cannot close the
+// fd of a durable handle whose connection is still alive. Before the fix the
+// deadline started at CREATE, so a handle held open past the timeout had its
+// descriptor closed underneath the client.
+func TestHardening_DurableAttachedNeverExpires(t *testing.T) {
+	tbl := NewDurableTable()
+	var cg, crg [16]byte
+	crg[0] = 0x01
+	tbl.Register(cg, crg, &Open{Path: "/in-use"}, time.Millisecond, "share", "alice")
+
+	if n := tbl.Expire(time.Now().Add(time.Hour)); n != 0 {
+		t.Errorf("Expire evicted %d attached entries, want 0 (connection still live)", n)
+	}
+	if !tbl.Has(cg, crg) {
+		t.Errorf("attached durable entry should still be present")
+	}
+
+	// Once the connection drops, the countdown starts and it does expire.
+	tbl.Detach(cg, crg)
+	if n := tbl.Expire(time.Now().Add(time.Hour)); n != 1 {
+		t.Errorf("Expire evicted %d detached entries, want 1", n)
+	}
+}
+
+// TestHardening_DurableReclaimChecksUser proves a durable handle can only be
+// reclaimed by the SMB user that opened it.
+func TestHardening_DurableReclaimChecksUser(t *testing.T) {
+	tbl := NewDurableTable()
+	var cg, crg [16]byte
+	crg[0] = 0x02
+	open := &Open{Path: "/owned"}
+	tbl.Register(cg, crg, open, time.Minute, "share", "alice")
+
+	if _, ok := tbl.ReclaimForShare(cg, crg, "share", "mallory"); ok {
+		t.Errorf("a different user reclaimed another user's durable handle")
+	}
+	if _, ok := tbl.ReclaimForShare(cg, crg, "share", "alice"); !ok {
+		t.Errorf("the owning user could not reclaim their own handle")
+	}
+}
+
+// TestHardening_UTF16SurrogateRoundTrip proves a non-BMP filename (emoji)
+// survives decode. Before the fix each UTF-16 code unit became its own rune,
+// so a surrogate pair decoded to two unpaired surrogates and the name was
+// mangled beyond recovery.
+func TestHardening_UTF16SurrogateRoundTrip(t *testing.T) {
+	for _, name := range []string{"rocket🚀.txt", "plain.txt", "café.txt", "𝔘𝔫𝔦𝔠𝔬𝔡𝔢"} {
+		if got := decodeUTF16LE(utf16leName(name)); got != name {
+			t.Errorf("round-trip of %q gave %q", name, got)
+		}
+	}
+}
+
+// TestHardening_ShareEnumRespectsACL proves share enumeration only reveals
+// shares the caller could actually connect to.
+func TestHardening_ShareEnumRespectsACL(t *testing.T) {
+	all := []config.ShareConfig{
+		{Name: "public", GuestOK: true},
+		{Name: "work"},
+		{Name: "hr-payroll-secret"},
+	}
+	restricted := &Session{User: config.UserConfig{Name: "bob", AllowShares: []string{"work"}}}
+	got := visibleShares(all, restricted)
+	if len(got) != 1 || got[0].Name != "work" {
+		t.Errorf("restricted user saw %v, want only [work]", shareNames(got))
+	}
+
+	guest := &Session{IsGuest: true}
+	got = visibleShares(all, guest)
+	if len(got) != 1 || got[0].Name != "public" {
+		t.Errorf("guest saw %v, want only [public]", shareNames(got))
+	}
+
+	admin := &Session{User: config.UserConfig{Name: "root", AllowShares: []string{"*"}}}
+	if got = visibleShares(all, admin); len(got) != 3 {
+		t.Errorf("wildcard user saw %d shares, want 3", len(got))
+	}
+}
+
+// TestHardening_TeardownClosesHandles proves TREE_DISCONNECT and LOGOFF release
+// the file descriptors and locks they own, instead of leaving them until the
+// whole connection dies, and that LOGOFF invalidates the SessionId.
+func TestHardening_TeardownClosesHandles(t *testing.T) {
+	shareDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(shareDir, "a.txt"), []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	tbl := NewSessionTable()
+	sess := tbl.New()
+	sess.Authenticated = true
+	share := config.ShareConfig{Name: "share", Path: shareDir}
+	d := &Dispatcher{
+		Log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Shares:   []config.ShareConfig{share},
+		Sessions: tbl,
+		Conn:     &Connection{},
+		locks:    sharedLockManager,
+	}
+	tree := sess.AddTree(share)
+
+	openFile := func() *Open {
+		var cbuf bytes.Buffer
+		d.handleCreate(&cbuf, smb2.Header{Command: smb2.CommandCreate, TreeID: tree.ID},
+			buildCreateBody("a.txt", smb2.CreateDispositionOpen, 0, smb2.AccessGenericRead, nil), sess)
+		o := sess.GetOpen(d.LastCreatedFileID)
+		if o == nil || o.File == nil {
+			t.Fatalf("create failed")
+		}
+		return o
+	}
+
+	// TREE_DISCONNECT must close the handle opened on that tree.
+	o1 := openFile()
+	var tbuf bytes.Buffer
+	d.handleTreeDisconnect(&tbuf, smb2.Header{Command: smb2.CommandTreeDisconnect, TreeID: tree.ID},
+		[]byte{0x04, 0x00, 0x00, 0x00}, sess)
+	if o1.File != nil {
+		t.Errorf("TREE_DISCONNECT left the handle open")
+	}
+	if sess.OpenCount() != 0 {
+		t.Errorf("TREE_DISCONNECT left %d opens registered", sess.OpenCount())
+	}
+
+	// LOGOFF must close remaining handles and drop the session.
+	tree = sess.AddTree(share)
+	o2 := openFile()
+	var lbuf bytes.Buffer
+	d.handleLogoff(&lbuf, smb2.Header{Command: smb2.CommandLogoff, SessionID: sess.ID}, sess)
+	if o2.File != nil {
+		t.Errorf("LOGOFF left the handle open")
+	}
+	if tbl.Get(sess.ID) != nil {
+		t.Errorf("LOGOFF left the SessionId valid")
+	}
+}
+
+// TestHardening_ShareRootNotDeletable proves DELETE_ON_CLOSE on the tree root
+// cannot remove the shared directory itself.
+func TestHardening_ShareRootNotDeletable(t *testing.T) {
+	shareDir := t.TempDir()
+	d, sess, tree := newTestDispatcher(t, shareDir)
+
+	open := &Open{Path: shareDir, IsDir: true, Tree: tree, DeleteOnClose: true}
+	if _, err := rand.Read(open.FileID[:]); err != nil {
+		t.Fatal(err)
+	}
+	sess.AddOpen(open)
+
+	var buf bytes.Buffer
+	d.handleClose(&buf, smb2.Header{Command: smb2.CommandClose}, buildCloseBody(open.FileID), sess)
+
+	if _, err := os.Stat(shareDir); err != nil {
+		t.Errorf("share root was deleted by DELETE_ON_CLOSE: %v", err)
+	}
+}
+
+// TestHardening_NotifyFilter proves the CompletionFilter is honoured instead of
+// every watch reporting every change.
+func TestHardening_NotifyFilter(t *testing.T) {
+	// A name-only filter must not deliver content modifications.
+	if notifyFilterAllows(smb2.NotifyFileName, smb2.FileActionModified) {
+		t.Errorf("FILE_NAME filter should not deliver a Modified action")
+	}
+	if !notifyFilterAllows(smb2.NotifyFileName, smb2.FileActionAdded) {
+		t.Errorf("FILE_NAME filter should deliver an Added action")
+	}
+	if !notifyFilterAllows(smb2.NotifyLastWrite, smb2.FileActionModified) {
+		t.Errorf("LAST_WRITE filter should deliver a Modified action")
+	}
+	// A zero filter means the client did not care: deliver everything.
+	if !notifyFilterAllows(0, smb2.FileActionModified) {
+		t.Errorf("an empty filter should deliver everything")
+	}
+}
+
+// TestHardening_NotifyCancelCompletesRequest proves SMB2_CANCEL completes the
+// outstanding notify rather than emitting a second response for the same
+// MessageId, and that closing the handle completes it with NOTIFY_CLEANUP.
+func TestHardening_NotifyCancelCompletesRequest(t *testing.T) {
+	d := &Dispatcher{Log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	open := &Open{Path: "/watched", IsDir: true}
+
+	reg := &notifyReg{open: open, cancel: make(chan struct{}), status: smb2.StatusCancelled}
+	d.registerNotify(42, reg)
+	if !d.cancelNotify(42, smb2.StatusCancelled) {
+		t.Fatalf("cancelNotify did not find the outstanding request")
+	}
+	select {
+	case <-reg.cancel:
+	default:
+		t.Errorf("cancel channel was not closed")
+	}
+	// A second cancel is a no-op (must not double-close the channel).
+	if d.cancelNotify(42, smb2.StatusCancelled) {
+		t.Errorf("second cancelNotify should report nothing to cancel")
+	}
+
+	// Closing the watched handle completes the notify with NOTIFY_CLEANUP.
+	reg2 := &notifyReg{open: open, cancel: make(chan struct{}), status: smb2.StatusCancelled}
+	d.registerNotify(43, reg2)
+	d.cancelNotifiesForOpens([]*Open{open})
+	select {
+	case <-reg2.cancel:
+	default:
+		t.Errorf("closing the handle did not complete its notify")
+	}
+	if reg2.status != smb2.StatusNotifyCleanup {
+		t.Errorf("notify completed with 0x%08X, want NOTIFY_CLEANUP", reg2.status)
 	}
 }

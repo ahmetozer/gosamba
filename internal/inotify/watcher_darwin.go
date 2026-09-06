@@ -429,6 +429,19 @@ func (w *Watcher) handleDirEvent(dir *watchedDir, kev unix.Kevent_t) {
 					slog.Debug("inotify addWatch", "path", ev.Path, "err", err)
 				}
 			}
+		case Modified:
+			// If the inode behind this name changed, the file was replaced
+			// (the write-temp-then-rename save pattern). Our kqueue watch is
+			// still on the old, unlinked vnode and would never fire again, so
+			// swap it onto the new inode.
+			if oldE, ok := oldSnap[name]; ok {
+				if newE, ok2 := newSnap[name]; ok2 && oldE.ino != newE.ino && !newE.isDir {
+					w.removeFileByPath(ev.Path)
+					if err := w.addFile(ev.Path); err != nil {
+						slog.Debug("inotify re-arm after replace", "path", ev.Path, "err", err)
+					}
+				}
+			}
 		case Delete, MovedFrom:
 			if e, ok := oldSnap[name]; ok {
 				if e.isDir {

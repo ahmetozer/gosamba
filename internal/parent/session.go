@@ -151,6 +151,53 @@ func (s *Session) RemoveTree(id uint32) {
 	delete(s.trees, id)
 }
 
+// RemoveTreeAndOpens removes a tree and detaches every open belonging to it,
+// returning those opens so the caller can release their locks and descriptors.
+// TREE_DISCONNECT must not leave a share's file handles behind: MS-SMB2
+// §3.3.5.9 requires the server to close them, and without it every fd stays
+// open until the whole connection dies.
+func (s *Session) RemoveTreeAndOpens(id uint32) []*Open {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.trees, id)
+	var out []*Open
+	for fid, o := range s.opens {
+		if o.Tree != nil && o.Tree.ID == id {
+			out = append(out, o)
+			delete(s.opens, fid)
+		}
+	}
+	return out
+}
+
+// TakeAllOpens removes and returns every open in the session, for LOGOFF or
+// session teardown.
+func (s *Session) TakeAllOpens() []*Open {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]*Open, 0, len(s.opens))
+	for fid, o := range s.opens {
+		out = append(out, o)
+		delete(s.opens, fid)
+	}
+	s.trees = make(map[uint32]*Tree)
+	return out
+}
+
+// OpenCount reports how many file handles the session currently holds.
+func (s *Session) OpenCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.opens)
+}
+
+// TreeCount reports how many trees the session currently holds.
+func (s *Session) TreeCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.trees)
+}
+
 func (s *Session) AddOpen(o *Open) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -203,6 +250,14 @@ func (t *SessionTable) New() *Session {
 	t.byID[id] = s
 	t.mu.Unlock()
 	return s
+}
+
+// Remove drops a session from the table, invalidating its SessionId. LOGOFF
+// must do this: leaving the entry keeps the id usable for further commands.
+func (t *SessionTable) Remove(id uint64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	delete(t.byID, id)
 }
 
 func (t *SessionTable) Get(id uint64) *Session {

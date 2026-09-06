@@ -3,8 +3,6 @@
 package parent
 
 import (
-	"sync"
-
 	"golang.org/x/sys/unix"
 )
 
@@ -14,11 +12,10 @@ import (
 // The conflict logic itself lives in the portable, unit-tested rangeTable
 // (lock_ranges.go); this type only adds the mutex and the (dev, ino) lookup.
 type lockManager struct {
-	mu    sync.Mutex
-	table *rangeTable
+	tbl *lockTable
 }
 
-func newLockManager() *lockManager { return &lockManager{table: newRangeTable()} }
+func newLockManager() *lockManager { return &lockManager{tbl: newLockTable()} }
 
 // keyFor identifies open's underlying file by (device, inode) via fstat, so
 // that locks are tracked per file identity rather than per path.
@@ -36,9 +33,7 @@ func (m *lockManager) applyLock(open *Open, offset, length uint64, kind lockKind
 	if err != nil {
 		return err
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.table.apply(key, open, offset, length, kind)
+	return m.tbl.apply(key, open, offset, length, kind)
 }
 
 func (m *lockManager) releaseAll(open *Open) {
@@ -46,7 +41,15 @@ func (m *lockManager) releaseAll(open *Open) {
 	if err != nil {
 		return
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.table.releaseOwner(key, open)
+	m.tbl.releaseOwner(key, open)
+}
+
+// conflictsWith reports whether an I/O by open over [offset,offset+length)
+// collides with a byte-range lock held by a different handle.
+func (m *lockManager) conflictsWith(open *Open, offset, length uint64, write bool) bool {
+	key, err := m.keyFor(open)
+	if err != nil {
+		return false
+	}
+	return m.tbl.conflict(key, open, offset, length, write)
 }

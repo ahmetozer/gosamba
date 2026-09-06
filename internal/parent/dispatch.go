@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode/utf16"
 
 	"github.com/ahmetozer/gosamba/internal/config"
 	"github.com/ahmetozer/gosamba/internal/inotify"
@@ -62,9 +63,128 @@ type Dispatcher struct {
 	// (CHANGE_NOTIFY completion) don't corrupt frames the main dispatcher
 	// is sending.
 	writeMu sync.Mutex
+
+	// notifyMu guards notifies, the table of outstanding CHANGE_NOTIFY
+	// requests. Each entry lets CLOSE / TREE_DISCONNECT / LOGOFF complete a
+	// pending notify (MS-SMB2 §3.3.5.19 requires STATUS_NOTIFY_CLEANUP rather
+	// than leaving the client waiting forever) and lets SMB2_CANCEL finish the
+	// original request instead of being answered with a second response.
+	notifyMu sync.Mutex
+	notifies map[uint64]*notifyReg
 	// nextAsyncID allocates AsyncIds for STATUS_PENDING responses.
 	nextAsyncID atomic.Uint64
 }
+
+// notifyReg is one outstanding CHANGE_NOTIFY request. cancel is closed exactly
+// once (guarded by the dispatcher's notifyMu) to wake the watching goroutine;
+// status carries the completion the canceller wants the client to see.
+type notifyReg struct {
+	open      *Open
+	cancel    chan struct{}
+	status    smb2.Status
+	cancelled bool
+}
+
+// registerNotify records an outstanding notify keyed by its MessageId.
+func (d *Dispatcher) registerNotify(msgID uint64, reg *notifyReg) {
+	d.notifyMu.Lock()
+	defer d.notifyMu.Unlock()
+	if d.notifies == nil {
+		d.notifies = make(map[uint64]*notifyReg)
+	}
+	d.notifies[msgID] = reg
+}
+
+func (d *Dispatcher) unregisterNotify(msgID uint64) {
+	d.notifyMu.Lock()
+	defer d.notifyMu.Unlock()
+	delete(d.notifies, msgID)
+}
+
+// cancelNotify completes one outstanding notify with the given status.
+func (d *Dispatcher) cancelNotify(msgID uint64, status smb2.Status) bool {
+	d.notifyMu.Lock()
+	defer d.notifyMu.Unlock()
+	reg, ok := d.notifies[msgID]
+	if !ok || reg.cancelled {
+		return false
+	}
+	reg.cancelled = true
+	reg.status = status
+	close(reg.cancel)
+	return true
+}
+
+// cancelNotifiesForOpens completes every notify registered against any of the
+// given handles. Called when those handles go away so the client is not left
+// waiting on a watch whose directory handle no longer exists.
+func (d *Dispatcher) cancelNotifiesForOpens(opens []*Open) {
+	if len(opens) == 0 {
+		return
+	}
+	set := make(map[*Open]struct{}, len(opens))
+	for _, o := range opens {
+		set[o] = struct{}{}
+	}
+	d.notifyMu.Lock()
+	defer d.notifyMu.Unlock()
+	for _, reg := range d.notifies {
+		if reg.cancelled {
+			continue
+		}
+		if _, ok := set[reg.open]; !ok {
+			continue
+		}
+		reg.cancelled = true
+		reg.status = smb2.StatusNotifyCleanup
+		close(reg.cancel)
+	}
+}
+
+// CancelAllNotifies completes every outstanding notify on this connection. It
+// is called during connection teardown: the watcher goroutines block until an
+// event or a cancel, so without this each abandoned CHANGE_NOTIFY would leak a
+// goroutine and its watch descriptors for the life of the process.
+func (d *Dispatcher) CancelAllNotifies() {
+	d.notifyMu.Lock()
+	defer d.notifyMu.Unlock()
+	for _, reg := range d.notifies {
+		if reg.cancelled {
+			continue
+		}
+		reg.cancelled = true
+		reg.status = smb2.StatusNotifyCleanup
+		close(reg.cancel)
+	}
+}
+
+// notifyFilterAllows reports whether an event action is one the client asked
+// for in its CompletionFilter. A filter of 0 is treated as "everything", which
+// is what clients that do not care send.
+func notifyFilterAllows(filter, action uint32) bool {
+	if filter == 0 {
+		return true
+	}
+	switch action {
+	case smb2.FileActionAdded, smb2.FileActionRemoved:
+		return filter&(smb2.NotifyFileName|smb2.NotifyDirName) != 0
+	case smb2.FileActionRenamedOldName, smb2.FileActionRenamedNewName:
+		return filter&(smb2.NotifyFileName|smb2.NotifyDirName) != 0
+	case smb2.FileActionModified:
+		return filter&(smb2.NotifyLastWrite|smb2.NotifySize|smb2.NotifyAttributes) != 0
+	}
+	return false
+}
+
+// Per-session resource caps. A client that opens handles or trees without ever
+// closing them would otherwise exhaust the process's file descriptors; these
+// bounds are far above any legitimate workload (Finder and rclone peak in the
+// low hundreds of concurrent opens) but keep a runaway or hostile client from
+// taking the server down.
+const (
+	maxOpensPerSession = 4096
+	maxTreesPerSession = 256
+)
 
 // maxStreamSize bounds an in-memory alternate-data-stream / resource-fork
 // buffer. It caps client-driven allocation and, more importantly, keeps a
@@ -260,8 +380,7 @@ func (d *Dispatcher) Dispatch(rw io.ReadWriter, hdr smb2.Header, body, frame []b
 	case smb2.CommandIoctl:
 		return d.handleIoctl(rw, hdr, body, sess)
 	case smb2.CommandLogoff:
-		d.respondSuccess(rw, hdr, sess, []byte{0x04, 0x00, 0x00, 0x00})
-		return true
+		return d.handleLogoff(rw, hdr, sess)
 	case smb2.CommandEcho:
 		d.respondSuccess(rw, hdr, sess, []byte{0x04, 0x00, 0x00, 0x00})
 		return true
@@ -269,7 +388,16 @@ func (d *Dispatcher) Dispatch(rw io.ReadWriter, hdr smb2.Header, body, frame []b
 		return d.handleChangeNotify(rw, hdr, body, sess)
 	case smb2.CommandLock:
 		return d.handleLock(rw, hdr, body, sess)
-	case smb2.CommandOplockBreak, smb2.CommandCancel:
+	case smb2.CommandCancel:
+		// SMB2_CANCEL never gets a response of its own (MS-SMB2 §3.3.5.16):
+		// the cancelled request completes with STATUS_CANCELLED instead.
+		// Replying here produced a second response for one MessageId and
+		// corrupted the client's outstanding-request table.
+		if !d.cancelNotify(hdr.MessageID, smb2.StatusCancelled) {
+			d.Log.Debug("cancel for unknown request", "msg_id", hdr.MessageID)
+		}
+		return true
+	case smb2.CommandOplockBreak:
 		d.respondError(rw, hdr, smb2.StatusNotSupported, sess)
 		return true
 	default:
@@ -330,6 +458,11 @@ func (d *Dispatcher) handleTreeConnect(rw io.ReadWriter, hdr smb2.Header, body [
 	if err != nil {
 		d.Log.Warn("tree-connect decode failed", "err", err)
 		d.respondError(rw, hdr, smb2.StatusInvalidParameter, sess)
+		return true
+	}
+	if sess.TreeCount() >= maxTreesPerSession {
+		d.Log.Warn("tree-connect: tree limit reached", "limit", maxTreesPerSession, "session_id", sess.ID)
+		d.respondError(rw, hdr, smb2.StatusInsufficientResources, sess)
 		return true
 	}
 	// Path is "\\server\share". Extract the trailing share name.
@@ -477,15 +610,77 @@ func shareAllowed(u config.UserConfig, shareName string) bool {
 	return false
 }
 
+// visibleShares returns the shares sess is permitted to connect to, applying
+// exactly the rules handleTreeConnect enforces. Share enumeration must not
+// reveal shares the caller could not mount: without this filter NetShareEnumAll
+// listed every configured share — including their names — to any authenticated
+// user, regardless of their allow_shares list.
+func visibleShares(all []config.ShareConfig, sess *Session) []config.ShareConfig {
+	if sess == nil {
+		return nil
+	}
+	out := make([]config.ShareConfig, 0, len(all))
+	for _, s := range all {
+		if sess.IsGuest {
+			if s.GuestOK {
+				out = append(out, s)
+			}
+			continue
+		}
+		if shareAllowed(sess.User, s.Name) {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
 // --- TREE_DISCONNECT ---
+
+// releaseOpens closes a batch of handles: byte-range locks first, then the
+// descriptor, and finally the durable-table entry so a disconnected tree or
+// session cannot be reclaimed and does not pin an fd.
+func (d *Dispatcher) releaseOpens(opens []*Open) {
+	// Complete any CHANGE_NOTIFY still watching these handles first, so the
+	// client gets STATUS_NOTIFY_CLEANUP rather than waiting on a dead handle.
+	d.cancelNotifiesForOpens(opens)
+	for _, o := range opens {
+		if o == nil {
+			continue
+		}
+		if o.IsDurable && d.Conn != nil && d.Conn.Durable != nil {
+			d.Conn.Durable.Remove(o.DurableClientGuid, o.DurableCreateGuid)
+		}
+		if o.File != nil {
+			if d.locks != nil {
+				d.locks.releaseAll(o)
+			}
+			o.File.Close()
+			o.File = nil
+		}
+	}
+}
 
 func (d *Dispatcher) handleTreeDisconnect(rw io.ReadWriter, hdr smb2.Header, body []byte, sess *Session) bool {
 	if _, err := smb2.DecodeTreeDisconnectRequest(body); err != nil {
 		d.respondError(rw, hdr, smb2.StatusInvalidParameter, sess)
 		return true
 	}
-	sess.RemoveTree(hdr.TreeID)
+	// Close every handle opened on this tree — otherwise its fds and locks
+	// survive until the whole connection drops.
+	d.releaseOpens(sess.RemoveTreeAndOpens(hdr.TreeID))
 	d.respondSuccess(rw, hdr, sess, smb2.EncodeTreeDisconnectResponse())
+	return true
+}
+
+// handleLogoff tears the session down: every open is closed and the SessionId
+// is invalidated. Previously LOGOFF only sent a success response, leaving the
+// id usable and every descriptor and lock in place.
+func (d *Dispatcher) handleLogoff(rw io.ReadWriter, hdr smb2.Header, sess *Session) bool {
+	d.releaseOpens(sess.TakeAllOpens())
+	d.respondSuccess(rw, hdr, sess, []byte{0x04, 0x00, 0x00, 0x00})
+	if d.Sessions != nil {
+		d.Sessions.Remove(sess.ID)
+	}
 	return true
 }
 
@@ -502,6 +697,11 @@ func (d *Dispatcher) handleCreate(rw io.ReadWriter, hdr smb2.Header, body []byte
 	if tree == nil {
 		d.Log.Warn("create: unknown tree", "tree_id", hdr.TreeID)
 		d.respondError(rw, hdr, smb2.StatusNetworkNameDeleted, sess)
+		return true
+	}
+	if sess.OpenCount() >= maxOpensPerSession {
+		d.Log.Warn("create: open limit reached", "limit", maxOpensPerSession, "session_id", sess.ID)
+		d.respondError(rw, hdr, smb2.StatusInsufficientResources, sess)
 		return true
 	}
 	d.Log.Debug("create",
@@ -805,7 +1005,7 @@ func (d *Dispatcher) handleCreate(rw io.ReadWriter, hdr smb2.Header, body []byte
 	// Register a durable handle and collect the extra response contexts
 	// (DH2Q/DHnQ echo, RqLs lease grant) to append to the AAPL/MxAc set.
 	respCtxs := buildCreateResponseContexts(req.CreateContexts, d.Conn, granted)
-	respCtxs = d.applyDurableAndLease(open, durReq, leaseReq, respCtxs)
+	respCtxs = d.applyDurableAndLease(open, durReq, leaseReq, respCtxs, sess.User.Name)
 
 	resp := smb2.EncodeCreateResponse(smb2.CreateResponse{
 		CreateAction:   createAction,
@@ -889,6 +1089,11 @@ func (d *Dispatcher) handleRead(rw io.ReadWriter, hdr smb2.Header, body []byte, 
 		d.respondError(rw, hdr, smb2.StatusInvalidParameter, sess)
 		return true
 	}
+	// A read may not cross another handle's exclusive byte-range lock.
+	if d.locks != nil && d.locks.conflictsWith(open, req.Offset, uint64(req.Length), false) {
+		d.respondError(rw, hdr, smb2.StatusFileLockConflict, sess)
+		return true
+	}
 	buf := make([]byte, req.Length)
 	n, err := open.File.ReadAt(buf, int64(req.Offset))
 	if err != nil && err != io.EOF {
@@ -926,7 +1131,7 @@ func (d *Dispatcher) handleWrite(rw io.ReadWriter, hdr smb2.Header, body []byte,
 	if open.IsPipe {
 		// Run DCE/RPC and queue the response for the next READ.
 		if open.PipeName == "srvsvc" {
-			if out := dcerpcHandle(req.Data, d.Shares); out != nil {
+			if out := dcerpcHandle(req.Data, visibleShares(d.Shares, sess)); out != nil {
 				open.pipeOut = append(open.pipeOut, out...)
 			}
 		}
@@ -958,6 +1163,12 @@ func (d *Dispatcher) handleWrite(rw io.ReadWriter, hdr smb2.Header, body []byte,
 	}
 	if open.File == nil {
 		d.respondError(rw, hdr, smb2.StatusInvalidParameter, sess)
+		return true
+	}
+	// A write may not touch any byte another handle holds locked, shared or
+	// exclusive.
+	if d.locks != nil && d.locks.conflictsWith(open, req.Offset, uint64(len(req.Data)), true) {
+		d.respondError(rw, hdr, smb2.StatusFileLockConflict, sess)
 		return true
 	}
 	n, err := open.File.WriteAt(req.Data, int64(req.Offset))
@@ -1144,11 +1355,14 @@ func decodeUTF16LE(b []byte) string {
 	if len(b)%2 != 0 {
 		b = b[:len(b)-1]
 	}
-	r := make([]rune, 0, len(b)/2)
+	u := make([]uint16, 0, len(b)/2)
 	for i := 0; i < len(b); i += 2 {
-		r = append(r, rune(uint16(b[i])|uint16(b[i+1])<<8))
+		u = append(u, uint16(b[i])|uint16(b[i+1])<<8)
 	}
-	return string(r)
+	// Surrogate pairs must be recombined into one rune; decoding each code
+	// unit separately corrupts every non-BMP filename (emoji and friends),
+	// which utf16leName then re-encodes as U+FFFD.
+	return string(utf16.Decode(u))
 }
 
 func timeFromFiletime(ft uint64) time.Time {
@@ -1173,6 +1387,9 @@ func (d *Dispatcher) handleClose(rw io.ReadWriter, hdr smb2.Header, body []byte,
 		d.respondError(rw, hdr, smb2.StatusInvalidParameter, sess)
 		return true
 	}
+	// Closing the directory handle must complete any CHANGE_NOTIFY watching it
+	// (MS-SMB2 §3.3.5.19), otherwise the client waits on a handle that is gone.
+	d.cancelNotifiesForOpens([]*Open{open})
 	// A clean CLOSE of a durable handle means it is no longer reclaimable —
 	// drop its durable-table entry (a dropped connection, by contrast, leaves
 	// it for reclaim until expiry).
@@ -1223,7 +1440,12 @@ func (d *Dispatcher) handleClose(rw io.ReadWriter, hdr smb2.Header, body []byte,
 		return true
 	}
 	if open.DeleteOnClose {
-		if err := os.Remove(open.Path); err != nil {
+		// Never let DELETE_ON_CLOSE on the tree root remove the shared
+		// directory itself — that would take the whole share offline.
+		if open.Tree != nil && open.Tree.Share.Path != "" &&
+			filepath.Clean(open.Path) == filepath.Clean(open.Tree.Share.Path) {
+			d.Log.Warn("refusing delete-on-close of the share root", "path", open.Path)
+		} else if err := os.Remove(open.Path); err != nil {
 			d.Log.Warn("delete-on-close failed", "path", open.Path, "err", err)
 		}
 	}
@@ -1870,7 +2092,7 @@ func (d *Dispatcher) handleIoctl(rw io.ReadWriter, hdr smb2.Header, body []byte,
 			}))
 			return true
 		}
-		out := dcerpcHandle(req.InputBuffer, d.Shares)
+		out := dcerpcHandle(req.InputBuffer, visibleShares(d.Shares, sess))
 		if out == nil {
 			d.respondError(rw, hdr, smb2.StatusInvalidParameter, sess)
 			return true
@@ -1982,74 +2204,101 @@ func (d *Dispatcher) handleChangeNotify(rw io.ReadWriter, hdr smb2.Header, body 
 	}
 
 	asyncID := d.nextAsyncID.Add(1)
+	watchTree := req.Flags&smb2.NotifyWatchTree != 0
+	filter := req.CompletionFilter
+	maxOut := req.OutputBufferLength
+
+	reg := &notifyReg{open: open, cancel: make(chan struct{}), status: smb2.StatusCancelled}
+	d.registerNotify(hdr.MessageID, reg)
 
 	// Send STATUS_PENDING (async-format header) immediately.
 	d.sendAsync(rw, hdr, sess, asyncID, smb2.StatusPending, []byte{0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
 
+	// accept filters one raw watcher event down to a wire entry, honouring
+	// SMB2_WATCH_TREE (without it only the immediate directory is reported)
+	// and the client's CompletionFilter.
+	accept := func(ev inotify.InotifyEvent) (smb2.NotifyEntry, bool) {
+		rel, err := filepath.Rel(open.Path, ev.Path)
+		if err != nil {
+			return smb2.NotifyEntry{}, false
+		}
+		if !watchTree && strings.Contains(rel, string(filepath.Separator)) {
+			// A change in a subdirectory: only a recursive watch reports it.
+			return smb2.NotifyEntry{}, false
+		}
+		action := actionForEvent(ev.Event)
+		if action == 0 || !notifyFilterAllows(filter, action) {
+			return smb2.NotifyEntry{}, false
+		}
+		return smb2.NotifyEntry{Action: action, Name: strings.ReplaceAll(rel, "/", "\\")}, true
+	}
+
 	go func() {
 		defer w.Close()
+		defer d.unregisterNotify(hdr.MessageID)
 		go w.Watch()
 
-		// Collect events until the buffer would overflow or the dir is closed.
 		var entries []smb2.NotifyEntry
-		timer := time.NewTimer(5 * time.Minute)
-		defer timer.Stop()
+		cancelled := false
 
-		for {
+		for len(entries) == 0 && !cancelled {
 			select {
 			case ev, ok := <-w.Events:
 				if !ok || ev.Event == inotify.WatchStop {
-					goto done
-				}
-				rel, err := filepath.Rel(open.Path, ev.Path)
-				if err != nil {
+					cancelled = true
 					continue
 				}
-				rel = strings.ReplaceAll(rel, "/", "\\")
-				action := actionForEvent(ev.Event)
-				if action == 0 {
+				e, keep := accept(ev)
+				if !keep {
 					continue
 				}
-				entries = append(entries, smb2.NotifyEntry{Action: action, Name: rel})
-				// Drain quickly: collect a short burst, then send.
+				entries = append(entries, e)
+				// Drain a short burst so a batch of changes ships in one reply.
 				drainTimer := time.NewTimer(30 * time.Millisecond)
-				drain := true
-				for drain {
+				for drain := true; drain; {
 					select {
 					case ev2, ok := <-w.Events:
 						if !ok || ev2.Event == inotify.WatchStop {
 							drain = false
-							break
-						}
-						rel2, err := filepath.Rel(open.Path, ev2.Path)
-						if err != nil {
 							continue
 						}
-						rel2 = strings.ReplaceAll(rel2, "/", "\\")
-						a := actionForEvent(ev2.Event)
-						if a == 0 {
-							continue
+						if e2, keep2 := accept(ev2); keep2 {
+							entries = append(entries, e2)
 						}
-						entries = append(entries, smb2.NotifyEntry{Action: a, Name: rel2})
 					case <-drainTimer.C:
+						drain = false
+					case <-reg.cancel:
 						drain = false
 					}
 				}
 				drainTimer.Stop()
-				goto done
-			case <-timer.C:
-				goto done
+			case <-reg.cancel:
+				cancelled = true
 			}
 		}
-	done:
-		buf := smb2.EncodeFileNotifyInformation(entries)
-		respBody := smb2.EncodeChangeNotifyResponse(smb2.ChangeNotifyResponse{Buffer: buf})
-		status := smb2.StatusSuccess
-		if len(entries) == 0 {
-			// Watcher closed without events.
-			status = smb2.StatusCancelled
+
+		if cancelled && len(entries) == 0 {
+			// CLOSE/TREE_DISCONNECT/CANCEL completed us: answer the original
+			// request with a plain error frame, not a CHANGE_NOTIFY body.
+			d.notifyMu.Lock()
+			status := reg.status
+			d.notifyMu.Unlock()
+			d.sendAsync(rw, hdr, sess, asyncID, status,
+				[]byte{0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
+			return
 		}
-		d.sendAsync(rw, hdr, sess, asyncID, status, respBody)
+
+		buf := smb2.EncodeFileNotifyInformation(entries)
+		// MS-SMB2 §3.3.5.19: if the changes do not fit in the buffer the client
+		// offered, report STATUS_NOTIFY_ENUM_DIR with no records so it re-scans
+		// the directory itself. Previously the oversized buffer was sent anyway.
+		if maxOut != 0 && uint32(len(buf)) > maxOut {
+			d.sendAsync(rw, hdr, sess, asyncID, smb2.StatusNotifyEnumDir,
+				smb2.EncodeChangeNotifyResponse(smb2.ChangeNotifyResponse{}))
+			return
+		}
+		d.sendAsync(rw, hdr, sess, asyncID, smb2.StatusSuccess,
+			smb2.EncodeChangeNotifyResponse(smb2.ChangeNotifyResponse{Buffer: buf}))
 	}()
 	return true
 }

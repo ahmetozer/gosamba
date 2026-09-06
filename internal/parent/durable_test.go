@@ -24,7 +24,7 @@ func TestDurableTable_RegisterReclaim(t *testing.T) {
 	crg[0] = 0xBB
 	open := &Open{Path: "/tmp/x", GrantedAccess: 0x1F01FF}
 
-	tbl.Register(cg, crg, open, time.Minute, "share")
+	tbl.Register(cg, crg, open, time.Minute, "share", "alice")
 	got, ok := tbl.Reclaim(cg, crg)
 	if !ok {
 		t.Fatalf("Reclaim returned ok=false, want true")
@@ -42,7 +42,10 @@ func TestDurableTable_ReclaimAfterExpiry(t *testing.T) {
 	tbl := NewDurableTable()
 	var cg, crg [16]byte
 	open := &Open{Path: "/tmp/y"}
-	tbl.Register(cg, crg, open, 5*time.Millisecond, "share")
+	tbl.Register(cg, crg, open, 5*time.Millisecond, "share", "alice")
+	// The entry is attached to a live connection until Detach, so the timeout
+	// only starts counting once the connection drops.
+	tbl.Detach(cg, crg)
 	time.Sleep(15 * time.Millisecond)
 	if _, ok := tbl.Reclaim(cg, crg); ok {
 		t.Fatalf("Reclaim after expiry returned ok=true, want false")
@@ -52,7 +55,7 @@ func TestDurableTable_ReclaimAfterExpiry(t *testing.T) {
 func TestDurableTable_Remove(t *testing.T) {
 	tbl := NewDurableTable()
 	var cg, crg [16]byte
-	tbl.Register(cg, crg, &Open{}, time.Minute, "share")
+	tbl.Register(cg, crg, &Open{}, time.Minute, "share", "alice")
 	tbl.Remove(cg, crg)
 	if _, ok := tbl.Reclaim(cg, crg); ok {
 		t.Fatalf("Reclaim after Remove returned ok=true, want false")
@@ -64,8 +67,10 @@ func TestDurableTable_Expire(t *testing.T) {
 	var cg, a, b [16]byte
 	a[0] = 1
 	b[0] = 2
-	tbl.Register(cg, a, &Open{}, 5*time.Millisecond, "share")
-	tbl.Register(cg, b, &Open{}, time.Hour, "share")
+	tbl.Register(cg, a, &Open{}, 5*time.Millisecond, "share", "alice")
+	tbl.Register(cg, b, &Open{}, time.Hour, "share", "alice")
+	tbl.Detach(cg, a)
+	tbl.Detach(cg, b)
 	time.Sleep(15 * time.Millisecond)
 	if n := tbl.Expire(time.Now()); n != 1 {
 		t.Fatalf("Expire evicted %d, want 1", n)
@@ -85,9 +90,9 @@ func TestDurableTable_ConcurrentAccess(t *testing.T) {
 			var cg, crg [16]byte
 			cg[0] = byte(n)
 			crg[1] = byte(n)
-			tbl.Register(cg, crg, &Open{}, time.Minute, "share")
+			tbl.Register(cg, crg, &Open{}, time.Minute, "share", "alice")
 			tbl.Reclaim(cg, crg)
-			tbl.Register(cg, crg, &Open{}, time.Minute, "share")
+			tbl.Register(cg, crg, &Open{}, time.Minute, "share", "alice")
 			tbl.Remove(cg, crg)
 			tbl.Expire(time.Now())
 		}(i)
@@ -400,7 +405,8 @@ func TestDurableTable_ExpireClosesFd(t *testing.T) {
 	open := &Open{File: f}
 
 	// Register with a 1 ms timeout so we can advance past it without sleeping.
-	tbl.Register(cg, crg, open, time.Millisecond, "share")
+	tbl.Register(cg, crg, open, time.Millisecond, "share", "alice")
+	tbl.Detach(cg, crg) // connection dropped: start the reclaim countdown
 
 	// Advance time by calling Expire with a future timestamp — no real sleep.
 	evicted := tbl.Expire(time.Now().Add(time.Second))
@@ -429,7 +435,8 @@ func TestDurableTable_LazyReclaimClosesFd(t *testing.T) {
 		t.Fatal(err)
 	}
 	open := &Open{File: f}
-	tbl.Register(cg, crg, open, time.Millisecond, "share")
+	tbl.Register(cg, crg, open, time.Millisecond, "share", "alice")
+	tbl.Detach(cg, crg) // connection dropped: start the reclaim countdown
 
 	// Sleep past the deadline so the entry is expired when Reclaim checks it.
 	time.Sleep(10 * time.Millisecond)
@@ -456,10 +463,10 @@ func TestDurableTable_ShareBinding(t *testing.T) {
 	crg[0] = 0xAB
 
 	open := &Open{Path: "/tmp/bound"}
-	tbl.Register(cg, crg, open, time.Minute, "shareA")
+	tbl.Register(cg, crg, open, time.Minute, "shareA", "alice")
 
 	// Wrong share: must fail without consuming the entry.
-	if _, ok := tbl.ReclaimForShare(cg, crg, "shareB"); ok {
+	if _, ok := tbl.ReclaimForShare(cg, crg, "shareB", "alice"); ok {
 		t.Fatalf("ReclaimForShare with wrong share returned ok=true, want false")
 	}
 	if tbl.len() != 1 {
@@ -467,7 +474,7 @@ func TestDurableTable_ShareBinding(t *testing.T) {
 	}
 
 	// Correct share: must succeed and consume the entry.
-	got, ok := tbl.ReclaimForShare(cg, crg, "shareA")
+	got, ok := tbl.ReclaimForShare(cg, crg, "shareA", "alice")
 	if !ok {
 		t.Fatalf("ReclaimForShare with correct share returned ok=false, want true")
 	}
