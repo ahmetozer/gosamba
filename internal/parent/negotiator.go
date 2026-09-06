@@ -21,6 +21,11 @@ type Connection struct {
 	NegotiateRequestMsg  []byte
 	NegotiateResponseMsg []byte
 
+	// MaxIOSize is the MaxRead/MaxWrite/MaxTransact size advertised in the
+	// NEGOTIATE response. READ/WRITE handlers clamp client-supplied lengths to
+	// it so a single request can't drive an unbounded allocation.
+	MaxIOSize uint32
+
 	// AAPLReadDirAttr latches once the client has negotiated AAPL with
 	// SUPPORTS_READ_DIR_ATTR. Subsequent QUERY_DIRECTORY level-37 responses
 	// then overlay Apple metadata (max_access, rfork_size, FinderInfo,
@@ -109,6 +114,10 @@ func Negotiate(rw io.ReadWriter, opts NegotiatorOptions, log *slog.Logger) (*Con
 	if maxIO == 0 {
 		maxIO = 8 << 20 // 8 MiB — clients negotiate down if they need to.
 	}
+	// Remember what we advertised so READ/WRITE/QUERY handlers can reject a
+	// client that asks for more than the negotiated maximum instead of trying
+	// to allocate an arbitrary wire-supplied size.
+	conn.MaxIOSize = maxIO
 	secMode := smb2.NegotiateSigningEnabled
 	if opts.RequireSigning {
 		secMode |= smb2.NegotiateSigningRequired

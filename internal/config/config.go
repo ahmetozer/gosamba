@@ -12,13 +12,25 @@ type Config struct {
 }
 
 type ServerConfig struct {
-	Listen         string
-	Netbios        bool
+	Listen string
+
+	// Netbios is accepted by the parser but NOT implemented: no NBSS listener
+	// exists, so :139 is never bound. Validate rejects it rather than let the
+	// flag imply legacy clients are served. Delete this field, the flag and
+	// the Validate check together if NetBIOS is ever really wired up.
+	Netbios bool
+
 	MDNS           bool
 	Encryption     EncryptionMode
 	Signing        SigningMode
 	DurableTimeout time.Duration
-	StateDir       string
+
+	// StateDir is parsed, merged and defaulted, but nothing reads it yet —
+	// durable handles live in an in-memory table (parent.DurableTable), not on
+	// disk. Reserved for when that state is persisted; setting it today has no
+	// effect. Unlike Netbios it is harmless, so it is accepted rather than
+	// rejected: a stale state_dir in an existing config must not break startup.
+	StateDir string
 
 	// PerUserPrivdrop enables the per-connection re-exec worker model: when set
 	// (and the process is root), each accepted connection is served by a child

@@ -17,16 +17,36 @@ import (
 	"github.com/ahmetozer/gosamba/internal/transport"
 )
 
+const (
+	// idleTimeout bounds how long a connection may go without delivering a
+	// complete frame. It is reset before every read, so it only fires on a
+	// genuinely idle or stalled peer (slow-loris), never on a busy one.
+	idleTimeout = 5 * time.Minute
+	// writeTimeout bounds a single response write, so a peer that stops
+	// reading cannot pin the connection through TCP backpressure. One frame is
+	// at most MaxIOSize, which completes far inside this window on any usable
+	// link.
+	writeTimeout = 2 * time.Minute
+)
+
 // bufRW is a tiny io.ReadWriter that pairs a buffered reader with the raw
 // writer (so writes don't pass through the buffer and stall waiting for
-// bufio's internal flushing).
+// bufio's internal flushing). It also applies a per-write deadline when the
+// underlying writer is a net.Conn.
 type bufRW struct {
 	r io.Reader
 	w io.Writer
+	c net.Conn
 }
 
-func (b *bufRW) Read(p []byte) (int, error)  { return b.r.Read(p) }
-func (b *bufRW) Write(p []byte) (int, error) { return b.w.Write(p) }
+func (b *bufRW) Read(p []byte) (int, error) { return b.r.Read(p) }
+
+func (b *bufRW) Write(p []byte) (int, error) {
+	if b.c != nil {
+		_ = b.c.SetWriteDeadline(time.Now().Add(writeTimeout))
+	}
+	return b.w.Write(p)
+}
 
 // ConnOptions controls per-connection protocol behavior.
 type ConnOptions struct {
@@ -59,16 +79,30 @@ func ServeConn(ctx context.Context, c net.Conn, log *slog.Logger, maxFrame uint3
 	log = log.With("remote", c.RemoteAddr().String())
 	log.Info("connection opened")
 
+	// Force the socket shut when the server context is cancelled, so a read
+	// blocked on an idle peer unblocks and this connection tears down.
+	//
+	// The watcher must also exit when THIS connection ends. Selecting on
+	// ctx.Done() alone parks the goroutine until server shutdown, so a server
+	// that has handled many short-lived connections accumulates one parked
+	// goroutine (and its captured net.Conn) per connection for the life of the
+	// process — an unauthenticated peer could grow that without bound just by
+	// connecting and disconnecting.
+	connDone := make(chan struct{})
+	defer close(connDone)
 	go func() {
-		<-ctx.Done()
-		_ = c.Close()
+		select {
+		case <-ctx.Done():
+			_ = c.Close()
+		case <-connDone:
+		}
 	}()
 
 	// Wrap the connection in a bufio.Reader so we coalesce the small
 	// NBSS-header read with whatever else is on the wire — one syscall
 	// instead of two per frame.
 	br := bufio.NewReaderSize(c, 64*1024)
-	rw := &bufRW{r: br, w: c}
+	rw := &bufRW{r: br, w: c, c: c}
 
 	conn, err := Negotiate(rw, NegotiatorOptions{
 		RequireEncryption: opts.RequireEncryption,
@@ -84,19 +118,31 @@ func ServeConn(ctx context.Context, c net.Conn, log *slog.Logger, maxFrame uint3
 	conn.DurableTimeout = opts.DurableTimeout
 
 	sessions := NewSessionTable()
+	// dispatcher is assigned just below; the teardown closure needs to see it,
+	// so it is declared before the defer that references it.
+	var dispatcher *Dispatcher
 	// On connection drop, close every file descriptor that is NOT held by a
 	// live durable-table entry. Durable opens must stay alive so the client can
 	// reconnect and reclaim them; ordinary (non-durable) opens must be closed
 	// to release kernel fds.
 	defer func() {
+		// Wake every outstanding CHANGE_NOTIFY goroutine so it exits and drops
+		// its watch descriptors instead of blocking forever on a dead client.
+		if dispatcher != nil {
+			dispatcher.CancelAllNotifies()
+		}
 		sessions.RangeSessions(func(s *Session) {
 			s.RangeOpens(func(o *Open) {
 				if o.File == nil {
 					return
 				}
 				// Leave durable opens: the table owns their fd for reclaim.
+				// Detach starts the reclaim countdown — until now the entry was
+				// attached to this (live) connection and could not expire, so
+				// the sweeper could never close an fd still in use.
 				if o.IsDurable && opts.Durable != nil &&
 					opts.Durable.Has(o.DurableClientGuid, o.DurableCreateGuid) {
+					opts.Durable.Detach(o.DurableClientGuid, o.DurableCreateGuid)
 					return
 				}
 				// Release any byte-range locks this open held before the fd
@@ -114,15 +160,23 @@ func ServeConn(ctx context.Context, c net.Conn, log *slog.Logger, maxFrame uint3
 		Shares:   opts.Shares,
 		Log:      log,
 	}
-	dispatcher := &Dispatcher{
-		Conn:     conn,
-		Sessions: sessions,
-		Shares:   opts.Shares,
-		Log:      log,
-		locks:    sharedLockManager,
+	dispatcher = &Dispatcher{
+		Conn:              conn,
+		Sessions:          sessions,
+		Shares:            opts.Shares,
+		Log:               log,
+		locks:             sharedLockManager,
+		RequireEncryption: opts.RequireEncryption,
+		RequireSigning:    opts.RequireSigning,
 	}
 
 	for {
+		// Bound how long a connection may sit without sending a complete frame.
+		// Without a deadline a client that opens a socket and stalls (or dribbles
+		// a partial NBSS header) pins a goroutine and its buffers indefinitely.
+		// SMB clients are chatty — real ones send at least an ECHO keepalive
+		// well inside this window — and the deadline is reset per frame.
+		_ = c.SetReadDeadline(time.Now().Add(idleTimeout))
 		frame, err := transport.ReadFrame(br, maxFrame)
 		if err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
@@ -156,7 +210,7 @@ func ServeConn(ctx context.Context, c net.Conn, log *slog.Logger, maxFrame uint3
 			}
 			frame = plain
 			encryptResp = true
-			sess.GotEncrypted = true
+			sess.SetGotEncrypted()
 		}
 
 		// Walk the (possibly compound) chain, dispatching each message over
@@ -179,6 +233,15 @@ func ServeConn(ctx context.Context, c net.Conn, log *slog.Logger, maxFrame uint3
 			}
 			end := len(frame)
 			if hdr.NextCommand != 0 {
+				// NextCommand is the byte offset from this message's header to
+				// the next one in the chain. It must clear this message's own
+				// 64-byte header and must not run past the frame; a value in
+				// (0, HeaderSize) would make body = msgBytes[HeaderSize:] slice
+				// out of range and panic the whole (unauthenticated) connection.
+				if hdr.NextCommand < smb2.HeaderSize {
+					log.Warn("NextCommand shorter than header", "next_command", hdr.NextCommand)
+					return
+				}
 				end = off + int(hdr.NextCommand)
 				if end > len(frame) {
 					log.Warn("NextCommand overruns frame", "next_command", hdr.NextCommand, "len", len(frame))

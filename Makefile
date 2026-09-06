@@ -1,4 +1,4 @@
-.PHONY: build build-darwin-arm64 build-darwin-amd64 test test-race fmt vet tidy clean e2e-deps
+.PHONY: build build-darwin-arm64 build-darwin-amd64 test test-race test-e2e fmt vet tidy clean e2e-deps
 
 e2e-deps:
 	apt-get install -y smbclient
@@ -17,6 +17,11 @@ test:
 
 test-race:
 	go test -race ./...
+
+# The smbclient-driven end-to-end tests are gated behind a build tag; without
+# it `make test` skips all of them. Requires `make e2e-deps` first.
+test-e2e:
+	go test -race -tags smbclient_e2e ./...
 
 fmt:
 	go fmt ./...

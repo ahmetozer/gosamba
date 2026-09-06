@@ -7,6 +7,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"sync"
+	"sync/atomic"
 )
 
 // SMB3 Transform Header (MS-SMB2 §2.2.41).
@@ -44,6 +46,73 @@ const (
 	CipherAES256CCM uint16 = 0x0003
 	CipherAES256GCM uint16 = 0x0004
 )
+
+// CipherKeyBits returns the length, in bits, of the encryption/decryption key
+// the given cipher needs — which is also the L value fed to the SMB3 KDF when
+// deriving it (MS-SMB2 §3.1.4.2: L is 256 for the AES-256 ciphers, 128 for
+// everything else).
+//
+// L is not just an output length: it is mixed into the PRF input, so a
+// 256-bit key is *not* the 128-bit key plus 16 more bytes — the whole key
+// differs. Callers must therefore derive at the right L rather than deriving
+// long and truncating. Note this applies only to the cipher keys: the signing
+// key and the application key stay 128-bit for every cipher, because SMB3
+// signing is always AES-128-CMAC/GMAC.
+//
+// An unknown or zero cipher id (encryption not negotiated) yields 128 so the
+// caller still gets a usable, if unused, key.
+func CipherKeyBits(cipherID uint16) uint32 {
+	switch cipherID {
+	case CipherAES256CCM, CipherAES256GCM:
+		return 256
+	default:
+		return 128
+	}
+}
+
+// Transform nonces.
+//
+// AES-GCM and AES-CCM both fail catastrophically when a nonce repeats under a
+// given key: two GCM frames sharing a nonce leak the XOR of their plaintexts
+// and, worse, expose the GHASH subkey, which lets an attacker forge frames.
+// MS-SMB2 §3.1.4.3 accordingly requires the nonce to be unique for every
+// invocation with a given key, and both Windows and Samba implement that as a
+// monotonically increasing counter rather than a fresh random draw.
+//
+// Drawing the nonce randomly (what this used to do) is not equivalent: the
+// transform nonce is only 12 bytes for GCM and 11 for CCM, so random nonces
+// collide by the birthday bound after roughly 2^48 / 2^44 frames on one key,
+// and NIST SP 800-38D caps random-IV GCM at 2^32 invocations per key. A large
+// copy over a long-lived session is well within shouting distance of those
+// numbers; a counter removes the question entirely.
+//
+// The counter is process-global rather than per-session. That is strictly
+// stronger than the per-session counter the spec asks for: no two frames this
+// process ever emits share a nonce, whatever key they were encrypted under, so
+// it holds even for the interim-plus-final response pairs that an async
+// command (CHANGE_NOTIFY) emits under one MessageId. The high bytes carry a
+// per-process random prefix so that nonces are not identical across restarts
+// either. It also keeps EncryptTransform's signature — and therefore every
+// caller — unchanged.
+var (
+	nonceCounter atomic.Uint64
+	// noncePrefix is generated once per process. crypto/rand.Read is
+	// documented never to fail as of Go 1.24, so there is no error to
+	// propagate; uniqueness rests on the counter regardless.
+	noncePrefix = sync.OnceValue(func() [8]byte {
+		var p [8]byte
+		_, _ = rand.Read(p[:])
+		return p
+	})
+)
+
+// nextNonce fills dst (11 or 12 bytes) with a nonce that this process has
+// never emitted before.
+func nextNonce(dst []byte) {
+	binary.LittleEndian.PutUint64(dst[:8], nonceCounter.Add(1))
+	prefix := noncePrefix()
+	copy(dst[8:], prefix[:])
+}
 
 // IsTransform reports whether buf begins with the SMB3 transform protocol ID.
 func IsTransform(buf []byte) bool {
@@ -99,13 +168,15 @@ func EncryptTransform(cipherID uint16, key []byte, sessID uint64, plaintext []by
 	if err != nil {
 		return nil, err
 	}
-	if nonceLen > 16 {
-		return nil, fmt.Errorf("smb3: nonce length %d exceeds 16", nonceLen)
+	// Both supported nonce lengths (11 for CCM, 12 for GCM) leave room for the
+	// 8-byte counter plus prefix; the bounds are asserted so a future cipher
+	// with a shorter nonce can't silently truncate the counter and start
+	// repeating nonces.
+	if nonceLen > 16 || nonceLen < 8 {
+		return nil, fmt.Errorf("smb3: unusable nonce length %d", nonceLen)
 	}
 	nonce := make([]byte, nonceLen)
-	if _, err := rand.Read(nonce); err != nil {
-		return nil, err
-	}
+	nextNonce(nonce)
 
 	out := make([]byte, TransformHeaderSize+len(plaintext)+16)
 	copy(out[:4], transformProtocolID[:])

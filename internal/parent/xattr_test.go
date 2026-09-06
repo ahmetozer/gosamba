@@ -191,7 +191,9 @@ func TestStream_PersistAcrossHandles(t *testing.T) {
 	rw := discardRW{}
 
 	// --- Handle 1: CREATE stream, WRITE bytes, CLOSE ---
-	createReq := smb2.CreateRequest{}
+	// OPEN_IF, not the zero value: zero is FILE_SUPERSEDE, which truncates the
+	// stream on open — this test is about content persisting across handles.
+	createReq := smb2.CreateRequest{CreateDisposition: smb2.CreateDispositionOpenIf}
 	hdr := smb2.Header{Command: smb2.CommandCreate}
 	d.handleCreateNamedStream(rw, hdr, sess, tree, createReq, "doc.txt", "mystream")
 	open := sess.GetOpen(d.LastCreatedFileID)
@@ -240,7 +242,7 @@ func TestStream_DeleteOnClose(t *testing.T) {
 
 	d, sess, tree := newTestDispatcher(t, shareDir)
 	rw := discardRW{}
-	d.handleCreateNamedStream(rw, smb2.Header{Command: smb2.CommandCreate}, sess, tree, smb2.CreateRequest{}, "doc.txt", "gone")
+	d.handleCreateNamedStream(rw, smb2.Header{Command: smb2.CommandCreate}, sess, tree, smb2.CreateRequest{CreateDisposition: smb2.CreateDispositionOpenIf}, "doc.txt", "gone")
 	open := sess.GetOpen(d.LastCreatedFileID)
 	open.DeleteOnClose = true
 	d.handleClose(rw, smb2.Header{Command: smb2.CommandClose}, buildCloseBody(open.FileID), sess)

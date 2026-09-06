@@ -45,6 +45,13 @@ jobs:
       - name: Test (race)
         run: go test -race ./...
 
+      # The smbclient-driven end-to-end tests are behind a build tag, so a plain
+      # `go test ./...` silently skips all of them. Run them explicitly wherever
+      # smbclient is installed, otherwise they never execute anywhere.
+      - name: Test (smbclient e2e)
+        if: runner.os == 'Linux'
+        run: go test -race -tags smbclient_e2e ./...
+
   docker:
     name: Docker build (no push)
     runs-on: ubuntu-latest

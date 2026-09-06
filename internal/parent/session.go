@@ -89,11 +89,35 @@ type Session struct {
 	C2SCipherKey   []byte
 	ApplicationKey []byte
 
-	// GotEncrypted latches once the client has sent an encrypted frame.
-	// We then reply encrypted for the rest of the session.
-	GotEncrypted bool
+	// Authenticated latches true once SESSION_SETUP completes successfully
+	// (type-3 NTLM verified, or an accepted guest). Until then the session
+	// exists only to carry the multi-leg NTLM handshake; the dispatcher must
+	// refuse every non-SESSION_SETUP command on an unauthenticated session.
+	Authenticated bool
+
+	// gotEncrypted latches once the client has sent an encrypted frame.
+	// We then reply encrypted for the rest of the session. It is read from
+	// the CHANGE_NOTIFY async goroutine while the read loop may set it, so it
+	// is accessed atomically.
+	gotEncrypted atomic.Bool
 
 	pendingChallenge [8]byte
+
+	// preauth is this session's fork of the SMB 3.1.1 preauth-integrity chain.
+	// Per MS-SMB2 §3.3.5.5.3 the chain forks per session: a new session copies
+	// Connection.PreauthIntegrityHashValue (which only NEGOTIATE updates) and
+	// folds its own SESSION_SETUP messages into the copy. Keeping the chain on
+	// the connection instead would let a second session on the same TCP
+	// connection derive its keys from a hash polluted by the first session's
+	// handshake, so its keys would not match what the client computed.
+	preauth *smb2.PreauthHash
+
+	// ntlmNegotiate and ntlmChallenge hold the exact NTLMSSP type-1 and type-2
+	// bytes of this session's handshake. They are retained solely so the
+	// type-3 MIC can be recomputed (MS-NLMP §3.2.5.1.2), and are released as
+	// soon as authentication completes.
+	ntlmNegotiate []byte
+	ntlmChallenge []byte
 
 	mu         sync.Mutex
 	trees      map[uint32]*Tree
@@ -112,6 +136,15 @@ func (s *Session) initTables() {
 		s.nextTreeID.Store(1)
 	}
 }
+
+// SetGotEncrypted latches that the client has sent at least one encrypted
+// frame on this session. Safe to call concurrently with GotEncrypted.
+func (s *Session) SetGotEncrypted() { s.gotEncrypted.Store(true) }
+
+// GotEncrypted reports whether the client has sent an encrypted frame. It is
+// read from the CHANGE_NOTIFY async goroutine and written by the read loop,
+// so it is backed by an atomic.
+func (s *Session) GotEncrypted() bool { return s.gotEncrypted.Load() }
 
 func (s *Session) AddTree(share config.ShareConfig) *Tree {
 	s.mu.Lock()
@@ -132,6 +165,53 @@ func (s *Session) RemoveTree(id uint32) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.trees, id)
+}
+
+// RemoveTreeAndOpens removes a tree and detaches every open belonging to it,
+// returning those opens so the caller can release their locks and descriptors.
+// TREE_DISCONNECT must not leave a share's file handles behind: MS-SMB2
+// §3.3.5.9 requires the server to close them, and without it every fd stays
+// open until the whole connection dies.
+func (s *Session) RemoveTreeAndOpens(id uint32) []*Open {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.trees, id)
+	var out []*Open
+	for fid, o := range s.opens {
+		if o.Tree != nil && o.Tree.ID == id {
+			out = append(out, o)
+			delete(s.opens, fid)
+		}
+	}
+	return out
+}
+
+// TakeAllOpens removes and returns every open in the session, for LOGOFF or
+// session teardown.
+func (s *Session) TakeAllOpens() []*Open {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]*Open, 0, len(s.opens))
+	for fid, o := range s.opens {
+		out = append(out, o)
+		delete(s.opens, fid)
+	}
+	s.trees = make(map[uint32]*Tree)
+	return out
+}
+
+// OpenCount reports how many file handles the session currently holds.
+func (s *Session) OpenCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.opens)
+}
+
+// TreeCount reports how many trees the session currently holds.
+func (s *Session) TreeCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.trees)
 }
 
 func (s *Session) AddOpen(o *Open) {
@@ -166,15 +246,40 @@ func (s *Session) RangeOpens(fn func(*Open)) {
 	}
 }
 
-// SessionTable is the parent's in-memory session map.
+// maxHalfOpenSessions bounds how many sessions one connection may have sitting
+// in the middle of an NTLM handshake at once. Every NTLMSSP type-1 leg creates
+// a session and nothing but a successful type-3 (or the connection dying) ever
+// retires it, so without a cap an unauthenticated peer can hold one socket open
+// and spray type-1 messages until the process runs out of memory. A real client
+// has exactly one handshake in flight; even a client re-authenticating several
+// users over one connection stays far below this. Mirrors the maxOpensPerSession
+// cap in dispatch.go.
+const maxHalfOpenSessions = 64
+
+// ErrTooManyHalfOpenSessions is returned when a connection exceeds
+// maxHalfOpenSessions. It is fatal to the connection: SESSION_SETUP errors tear
+// the connection down, which is the right answer for a peer behaving this way.
+var ErrTooManyHalfOpenSessions = errors.New("too many unauthenticated sessions on one connection")
+
+// SessionTable is the parent's in-memory session map. One table is created per
+// TCP connection, so its counts are inherently per-connection.
 type SessionTable struct {
 	mu     sync.Mutex
 	byID   map[uint64]*Session
 	nextID atomic.Uint64
+	// halfOpen holds the ids of sessions created for an NTLM handshake that
+	// has not completed. Membership is tracked here rather than by scanning
+	// Session.Authenticated because that field is written by the read loop
+	// without the table lock; keeping the bookkeeping in the table keeps the
+	// cap race-free without changing how the rest of the server reads it.
+	halfOpen map[uint64]struct{}
 }
 
 func NewSessionTable() *SessionTable {
-	t := &SessionTable{byID: make(map[uint64]*Session)}
+	t := &SessionTable{
+		byID:     make(map[uint64]*Session),
+		halfOpen: make(map[uint64]struct{}),
+	}
 	t.nextID.Store(1)
 	return t
 }
@@ -186,6 +291,47 @@ func (t *SessionTable) New() *Session {
 	t.byID[id] = s
 	t.mu.Unlock()
 	return s
+}
+
+// NewHalfOpen creates a session for an in-flight NTLM handshake, refusing once
+// the connection already holds maxHalfOpenSessions of them. The session is
+// retired from the half-open set by MarkAuthenticated or Remove.
+func (t *SessionTable) NewHalfOpen() (*Session, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if len(t.halfOpen) >= maxHalfOpenSessions {
+		return nil, fmt.Errorf("%w (limit %d)", ErrTooManyHalfOpenSessions, maxHalfOpenSessions)
+	}
+	id := t.nextID.Add(1)
+	s := &Session{ID: id}
+	t.byID[id] = s
+	t.halfOpen[id] = struct{}{}
+	return s, nil
+}
+
+// MarkAuthenticated retires a session from the half-open set, freeing its slot.
+// Idempotent, so a client that re-runs SESSION_SETUP on a live session doesn't
+// double-free.
+func (t *SessionTable) MarkAuthenticated(id uint64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	delete(t.halfOpen, id)
+}
+
+// HalfOpenCount reports how many sessions are still mid-handshake.
+func (t *SessionTable) HalfOpenCount() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return len(t.halfOpen)
+}
+
+// Remove drops a session from the table, invalidating its SessionId. LOGOFF
+// must do this: leaving the entry keeps the id usable for further commands.
+func (t *SessionTable) Remove(id uint64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	delete(t.byID, id)
+	delete(t.halfOpen, id)
 }
 
 func (t *SessionTable) Get(id uint64) *Session {
@@ -279,7 +425,10 @@ func (h *SessionSetupHandler) HandleSessionSetup(rw io.ReadWriter, hdr smb2.Head
 }
 
 func (h *SessionSetupHandler) handleType1(rw io.ReadWriter, hdr smb2.Header, type1, requestFrame []byte) (*Session, error) {
-	sess := h.Sessions.New()
+	sess, err := h.Sessions.NewHalfOpen()
+	if err != nil {
+		return nil, err
+	}
 
 	if _, err := rand.Read(sess.pendingChallenge[:]); err != nil {
 		return nil, err
@@ -302,6 +451,15 @@ func (h *SessionSetupHandler) handleType1(rw io.ReadWriter, hdr smb2.Header, typ
 		TargetInfo: avPairs,
 	})
 
+	// Retain both halves of the handshake so handleType3 can recompute the
+	// NTLMSSP MIC. type1 is what UnwrapNTLM pulled out of the client's SPNEGO
+	// NegTokenInit; there is nothing after the mechToken in that token (a
+	// mechListMIC needs a session key the client does not have yet), so these
+	// are exactly the NEGOTIATE_MESSAGE bytes the client hashed. type2 is
+	// verbatim what we are about to send.
+	sess.ntlmNegotiate = append([]byte(nil), type1...)
+	sess.ntlmChallenge = append([]byte(nil), type2...)
+
 	spnego := smb2.WrapNTLMResp(smb2.SPNEGOAcceptIncomplete, type2)
 
 	respBody := smb2.EncodeSessionSetupResponse(smb2.SessionSetupResponse{
@@ -323,9 +481,14 @@ func (h *SessionSetupHandler) handleType1(rw io.ReadWriter, hdr smb2.Header, typ
 	}
 	copy(full[smb2.HeaderSize:], respBody)
 
-	// Fold request and response into preauth (per MS-SMB2 §3.1.4.4.1).
-	h.Conn.Preauth.Update(requestFrame)
-	h.Conn.Preauth.Update(full)
+	// Fold request and response into this session's preauth chain (MS-SMB2
+	// §3.1.4.4.1). The chain forks here: the session starts from a copy of the
+	// connection hash (which carries only the NEGOTIATE exchange) so a second
+	// session on this connection is not salted with the first one's
+	// SESSION_SETUP messages.
+	sess.preauth = forkPreauth(h.Conn.Preauth)
+	sess.preauth.Update(requestFrame)
+	sess.preauth.Update(full)
 
 	if err := transport.WriteFrame(rw, full); err != nil {
 		return nil, err
@@ -363,11 +526,16 @@ func (h *SessionSetupHandler) handleType3(rw io.ReadWriter, hdr smb2.Header, typ
 		}
 	}
 
-	// Fold the type-3 request into the preauth chain only for 3.1.1 — pre-3.1.1
-	// dialects don't use preauth integrity at all.
+	// Fold the type-3 request into this session's preauth chain, only for
+	// 3.1.1 — pre-3.1.1 dialects don't use preauth integrity at all. A session
+	// that somehow reached type-3 without a type-1 leg has no fork yet, so make
+	// one from the connection chain rather than dereferencing nil.
 	dialect := h.Conn.Selection.Dialect
+	if sess.preauth == nil {
+		sess.preauth = forkPreauth(h.Conn.Preauth)
+	}
 	if dialect == smb2.Dialect311 {
-		h.Conn.Preauth.Update(requestFrame)
+		sess.preauth.Update(requestFrame)
 	}
 
 	if !isGuest {
@@ -382,16 +550,34 @@ func (h *SessionSetupHandler) handleType3(rw io.ReadWriter, hdr smb2.Header, typ
 			sessionKey = make([]byte, 16)
 			rc4xor(sbk[:], auth.EncryptedRandomSessionKey, sessionKey)
 		}
+		// sessionKey is now ExportedSessionKey, which is what the MIC is keyed
+		// with, so the MIC can be checked before it is used to derive anything.
+		if err := h.verifyMIC(sess, auth, type3, sessionKey); err != nil {
+			return nil, h.failAuth(rw, hdr, fmt.Errorf("user %q: %w", auth.UserName, err))
+		}
 
 		switch dialect {
 		case smb2.Dialect311:
-			preauth := h.Conn.Preauth.Sum()
+			preauth := sess.preauth.Sum()
+			// The cipher keys are derived at the length the negotiated cipher
+			// actually consumes: MS-SMB2 §3.1.4.2 uses L=256 for the AES-256
+			// ciphers and L=128 otherwise. Deriving 128 bits unconditionally
+			// (as this did) makes every AES-256 session unusable — newAEAD
+			// rejects the short key, so every encrypted frame fails — and
+			// AES-256-GCM is exactly what a current Windows client picks. The
+			// signing and application keys stay at 128 bits for every cipher:
+			// SMB3 signing is always AES-128-CMAC/GMAC.
+			cipherBits := smb3.CipherKeyBits(uint16(h.Conn.Selection.Cipher))
 			sess.SigningKey = smb3.KDF(sessionKey, []byte("SMBSigningKey\x00"), preauth[:], 128)
-			sess.S2CCipherKey = smb3.KDF(sessionKey, []byte("SMBS2CCipherKey\x00"), preauth[:], 128)
-			sess.C2SCipherKey = smb3.KDF(sessionKey, []byte("SMBC2SCipherKey\x00"), preauth[:], 128)
+			sess.S2CCipherKey = smb3.KDF(sessionKey, []byte("SMBS2CCipherKey\x00"), preauth[:], cipherBits)
+			sess.C2SCipherKey = smb3.KDF(sessionKey, []byte("SMBC2SCipherKey\x00"), preauth[:], cipherBits)
 			sess.ApplicationKey = smb3.KDF(sessionKey, []byte("SMBAppKey\x00"), preauth[:], 128)
 		case smb2.Dialect300, smb2.Dialect302:
-			// 3.0 / 3.0.2 use fixed context strings instead of preauth.
+			// 3.0 / 3.0.2 use fixed context strings instead of preauth. 128 bits
+			// is right for every key here and needs no cipher-dependent length:
+			// the AES-256 ciphers are negotiated through a 3.1.1 negotiate
+			// context, so these dialects only ever run AES-128-CCM (which is
+			// also all Select() will choose for them).
 			sess.SigningKey = smb3.KDF(sessionKey, []byte("SMB2AESCMAC\x00"), []byte("SmbSign\x00"), 128)
 			sess.S2CCipherKey = smb3.KDF(sessionKey, []byte("SMB2AESCCM\x00"), []byte("ServerOut\x00"), 128)
 			sess.C2SCipherKey = smb3.KDF(sessionKey, []byte("SMB2AESCCM\x00"), []byte("ServerIn \x00"), 128)
@@ -404,6 +590,16 @@ func (h *SessionSetupHandler) handleType3(rw io.ReadWriter, hdr smb2.Header, typ
 	}
 	sess.User = *user
 	sess.IsGuest = isGuest
+	// Authentication is complete: the dispatcher may now serve commands on
+	// this session. (Set before writing the response so a pipelined follow-up
+	// request can never race ahead of the flag.)
+	sess.Authenticated = true
+	// The handshake is over: give the half-open slot back so a long-lived
+	// connection that re-authenticates never accumulates against the cap, and
+	// drop the retained NTLM messages now that the MIC has been checked.
+	h.Sessions.MarkAuthenticated(sess.ID)
+	sess.ntlmNegotiate = nil
+	sess.ntlmChallenge = nil
 
 	var sessFlags uint16
 	if isGuest {
@@ -444,6 +640,53 @@ func (h *SessionSetupHandler) handleType3(rw io.ReadWriter, hdr smb2.Header, typ
 		"guest", isGuest,
 	)
 	return sess, nil
+}
+
+// verifyMIC checks the NTLMSSP AUTHENTICATE message-integrity code.
+//
+// The MIC is what authenticates the parts of the handshake that NTLMv2 itself
+// leaves unprotected — above all the NEGOTIATE_MESSAGE's flags, which an active
+// attacker would otherwise be free to rewrite (stripping NEGOTIATE_SEAL, say)
+// without either end noticing. exportedSessionKey is the key the client used,
+// i.e. the post-key-exchange session key.
+//
+// Whether a MIC is expected is decided by the MsvAvFlags bit inside the NTLMv2
+// response, not by the presence of a MIC field: those AV pairs are covered by
+// NTProofStr, which VerifyNTLMv2 has already checked, so the bit cannot have
+// been cleared in flight. That closes the obvious downgrade — an attacker
+// zeroing the MIC field and hoping the server shrugs.
+func (h *SessionSetupHandler) verifyMIC(sess *Session, auth ntlm.AuthenticateMessage, type3, exportedSessionKey []byte) error {
+	if !ntlm.MICRequired(auth.NtResponse) {
+		// Client didn't compute one. Nothing to verify, and nothing an
+		// attacker could have removed.
+		return nil
+	}
+	if !auth.HasMIC {
+		return errors.New("ntlm: AUTHENTICATE asserts a MIC but has no MIC field")
+	}
+	if len(sess.ntlmNegotiate) == 0 || len(sess.ntlmChallenge) == 0 {
+		// Only reachable if the type-3 arrived on a session that never ran
+		// through handleType1, in which case there is no handshake to hash.
+		return errors.New("ntlm: MIC required but the handshake messages were not retained")
+	}
+	// Trim any SPNEGO tail (typically the mechListMIC that follows the
+	// responseToken) so the hash covers exactly the AUTHENTICATE_MESSAGE.
+	authMsg := type3[:ntlm.AuthenticateLen(type3)]
+	if !ntlm.VerifyMIC(exportedSessionKey, sess.ntlmNegotiate, sess.ntlmChallenge, authMsg, auth.MIC) {
+		return errors.New("ntlm: AUTHENTICATE MIC mismatch (handshake was tampered with)")
+	}
+	return nil
+}
+
+// forkPreauth returns an independent copy of a preauth chain. smb2.PreauthHash
+// is a plain value (a 64-byte rolling state), so copying the struct copies the
+// chain up to that point.
+func forkPreauth(base *smb2.PreauthHash) *smb2.PreauthHash {
+	if base == nil {
+		return smb2.NewPreauthHash()
+	}
+	forked := *base
+	return &forked
 }
 
 func (h *SessionSetupHandler) failAuth(rw io.ReadWriter, hdr smb2.Header, cause error) error {

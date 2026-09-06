@@ -39,10 +39,17 @@ type FileShare struct {
 }
 
 type FileUser struct {
-	Name        string   `toml:"name"`
-	NTHash      [16]byte `toml:"-"`
-	NTHashHex   string   `toml:"nt_hash"`
-	SystemUser  string   `toml:"system_user"`
+	Name      string   `toml:"name"`
+	NTHash    [16]byte `toml:"-"`
+	NTHashHex string   `toml:"nt_hash"`
+
+	SystemUser string `toml:"system_user"`
+
+	// AllowShares distinguishes absent from empty by nil-ness, and Merge
+	// depends on it: nil means the key was not present (grant every share, for
+	// backward compatibility), while a non-nil empty slice means the operator
+	// wrote allow_shares = [] and is granting nothing. decodeTOMLFile
+	// guarantees the non-nil empty slice for "[]"; keep it that way.
 	AllowShares []string `toml:"allow_shares"`
 }
 

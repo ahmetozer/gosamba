@@ -24,7 +24,7 @@ func TestDurableTable_RegisterReclaim(t *testing.T) {
 	crg[0] = 0xBB
 	open := &Open{Path: "/tmp/x", GrantedAccess: 0x1F01FF}
 
-	tbl.Register(cg, crg, open, time.Minute, "share")
+	tbl.Register(cg, crg, open, time.Minute, "share", "alice")
 	got, ok := tbl.Reclaim(cg, crg)
 	if !ok {
 		t.Fatalf("Reclaim returned ok=false, want true")
@@ -42,7 +42,10 @@ func TestDurableTable_ReclaimAfterExpiry(t *testing.T) {
 	tbl := NewDurableTable()
 	var cg, crg [16]byte
 	open := &Open{Path: "/tmp/y"}
-	tbl.Register(cg, crg, open, 5*time.Millisecond, "share")
+	tbl.Register(cg, crg, open, 5*time.Millisecond, "share", "alice")
+	// The entry is attached to a live connection until Detach, so the timeout
+	// only starts counting once the connection drops.
+	tbl.Detach(cg, crg)
 	time.Sleep(15 * time.Millisecond)
 	if _, ok := tbl.Reclaim(cg, crg); ok {
 		t.Fatalf("Reclaim after expiry returned ok=true, want false")
@@ -52,7 +55,7 @@ func TestDurableTable_ReclaimAfterExpiry(t *testing.T) {
 func TestDurableTable_Remove(t *testing.T) {
 	tbl := NewDurableTable()
 	var cg, crg [16]byte
-	tbl.Register(cg, crg, &Open{}, time.Minute, "share")
+	tbl.Register(cg, crg, &Open{}, time.Minute, "share", "alice")
 	tbl.Remove(cg, crg)
 	if _, ok := tbl.Reclaim(cg, crg); ok {
 		t.Fatalf("Reclaim after Remove returned ok=true, want false")
@@ -64,8 +67,10 @@ func TestDurableTable_Expire(t *testing.T) {
 	var cg, a, b [16]byte
 	a[0] = 1
 	b[0] = 2
-	tbl.Register(cg, a, &Open{}, 5*time.Millisecond, "share")
-	tbl.Register(cg, b, &Open{}, time.Hour, "share")
+	tbl.Register(cg, a, &Open{}, 5*time.Millisecond, "share", "alice")
+	tbl.Register(cg, b, &Open{}, time.Hour, "share", "alice")
+	tbl.Detach(cg, a)
+	tbl.Detach(cg, b)
 	time.Sleep(15 * time.Millisecond)
 	if n := tbl.Expire(time.Now()); n != 1 {
 		t.Fatalf("Expire evicted %d, want 1", n)
@@ -85,9 +90,9 @@ func TestDurableTable_ConcurrentAccess(t *testing.T) {
 			var cg, crg [16]byte
 			cg[0] = byte(n)
 			crg[1] = byte(n)
-			tbl.Register(cg, crg, &Open{}, time.Minute, "share")
+			tbl.Register(cg, crg, &Open{}, time.Minute, "share", "alice")
 			tbl.Reclaim(cg, crg)
-			tbl.Register(cg, crg, &Open{}, time.Minute, "share")
+			tbl.Register(cg, crg, &Open{}, time.Minute, "share", "alice")
 			tbl.Remove(cg, crg)
 			tbl.Expire(time.Now())
 		}(i)
@@ -261,8 +266,12 @@ func TestHandleCreate_DurableGrantAndReconnect(t *testing.T) {
 
 	// --- 2: simulate connection drop. The Open stays in the session in this
 	// white-box harness, but the durable entry must survive for reclaim. Drop
-	// it from the session to emulate a fresh connection. ---
+	// it from the session to emulate a fresh connection, and Detach the entry
+	// exactly as ServeConn's teardown does — a reconnect is only valid against
+	// a disconnected open, so without the Detach the reclaim is (correctly)
+	// refused as a takeover attempt. ---
 	sess.RemoveOpen(firstFileID)
+	tbl.Detach(d.Conn.ClientGuid, createGuid)
 	sess2 := &Session{}
 	sess2.AddTree(d.Shares[0])
 
@@ -367,7 +376,10 @@ func TestHandleCreate_LeaseEcho(t *testing.T) {
 	if !hasContext(rctxs, tagRqLs) {
 		t.Fatalf("response did not echo RqLs")
 	}
-	// Verify the granted state is exactly READ caching (we never grant W/H).
+	// Verify the granted state is LEASE_NONE. We implement no lease-break
+	// machinery, so granting any caching (even READ) would let a client serve
+	// stale data after another opener modifies the file; echoing LEASE_NONE
+	// keeps it re-reading from the server.
 	var granted uint32
 	smb2.IterateCreateContexts(rctxs, func(c smb2.CreateContext) bool {
 		if eqTag(c.Name, tagRqLs) && len(c.Data) >= 20 {
@@ -376,8 +388,8 @@ func TestHandleCreate_LeaseEcho(t *testing.T) {
 		}
 		return true
 	})
-	if granted != leaseReadCaching {
-		t.Fatalf("granted lease state=0x%X, want 0x%X (READ only)", granted, leaseReadCaching)
+	if granted != leaseNone {
+		t.Fatalf("granted lease state=0x%X, want 0x%X (LEASE_NONE)", granted, leaseNone)
 	}
 }
 
@@ -397,7 +409,8 @@ func TestDurableTable_ExpireClosesFd(t *testing.T) {
 	open := &Open{File: f}
 
 	// Register with a 1 ms timeout so we can advance past it without sleeping.
-	tbl.Register(cg, crg, open, time.Millisecond, "share")
+	tbl.Register(cg, crg, open, time.Millisecond, "share", "alice")
+	tbl.Detach(cg, crg) // connection dropped: start the reclaim countdown
 
 	// Advance time by calling Expire with a future timestamp — no real sleep.
 	evicted := tbl.Expire(time.Now().Add(time.Second))
@@ -426,7 +439,8 @@ func TestDurableTable_LazyReclaimClosesFd(t *testing.T) {
 		t.Fatal(err)
 	}
 	open := &Open{File: f}
-	tbl.Register(cg, crg, open, time.Millisecond, "share")
+	tbl.Register(cg, crg, open, time.Millisecond, "share", "alice")
+	tbl.Detach(cg, crg) // connection dropped: start the reclaim countdown
 
 	// Sleep past the deadline so the entry is expired when Reclaim checks it.
 	time.Sleep(10 * time.Millisecond)
@@ -444,7 +458,7 @@ func TestDurableTable_LazyReclaimClosesFd(t *testing.T) {
 	}
 }
 
-// TestDurableTable_ShareBinding verifies that ReclaimForShare rejects a
+// TestDurableTable_ShareBinding verifies that a reconnect rejects a
 // reconnect arriving on the wrong share (entry is NOT consumed) and succeeds on
 // the correct share.
 func TestDurableTable_ShareBinding(t *testing.T) {
@@ -453,26 +467,28 @@ func TestDurableTable_ShareBinding(t *testing.T) {
 	crg[0] = 0xAB
 
 	open := &Open{Path: "/tmp/bound"}
-	tbl.Register(cg, crg, open, time.Minute, "shareA")
+	tbl.Register(cg, crg, open, time.Minute, "shareA", "alice")
 
 	// Wrong share: must fail without consuming the entry.
-	if _, ok := tbl.ReclaimForShare(cg, crg, "shareB"); ok {
-		t.Fatalf("ReclaimForShare with wrong share returned ok=true, want false")
+	if _, ok := tbl.reclaimForReconnect(cg, crg, "shareB", "alice"); ok {
+		t.Fatalf("reconnect with wrong share returned ok=true, want false")
 	}
 	if tbl.len() != 1 {
 		t.Fatalf("entry consumed by wrong-share reclaim, len=%d want 1", tbl.len())
 	}
 
-	// Correct share: must succeed and consume the entry.
-	got, ok := tbl.ReclaimForShare(cg, crg, "shareA")
+	// Correct share: must succeed and consume the entry. Detach first — a
+	// reconnect is only valid against an open whose connection has gone.
+	tbl.Detach(cg, crg)
+	got, ok := tbl.reclaimForReconnect(cg, crg, "shareA", "alice")
 	if !ok {
-		t.Fatalf("ReclaimForShare with correct share returned ok=false, want true")
+		t.Fatalf("reconnect with correct share returned ok=false, want true")
 	}
 	if got != open {
-		t.Fatalf("ReclaimForShare returned wrong open")
+		t.Fatalf("reconnect returned wrong open")
 	}
 	if tbl.len() != 0 {
-		t.Fatalf("entry not consumed after successful ReclaimForShare, len=%d want 0", tbl.len())
+		t.Fatalf("entry not consumed after successful reconnect, len=%d want 0", tbl.len())
 	}
 }
 
@@ -523,8 +539,11 @@ func TestHandleCreate_DurableReconnectWrongShareFails(t *testing.T) {
 	}
 	firstFileID := resp.FileID
 
-	// Simulate drop: remove open from session.
+	// Simulate drop: remove the open from the session and detach the durable
+	// entry, mirroring ServeConn's teardown. Until it is detached the entry is
+	// still owned by a live connection and no reconnect may reclaim it.
 	sessA.RemoveOpen(firstFileID)
+	tbl.Detach(conn.ClientGuid, createGuid)
 
 	// --- 2: reconnect on shareB --- must fail, entry untouched ---
 	sessB := &Session{}

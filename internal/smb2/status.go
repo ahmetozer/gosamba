@@ -32,5 +32,35 @@ const (
 	StatusNetworkNameDeleted  Status = 0xC00000C9
 	StatusBufferOverflow      Status = 0x80000005
 	StatusLockNotGranted      Status = 0xC0000055
+	StatusFileLockConflict    Status = 0xC0000054
 	StatusDiskFull            Status = 0xC000007F
+	// StatusInsufficientResources is what a server returns when it refuses to
+	// allocate more per-session state (handles, trees) for a client.
+	StatusInsufficientResources Status = 0xC000009A
+
+	// The block below exists so statusFromErr can report the *actual* POSIX
+	// failure instead of collapsing everything to STATUS_INTERNAL_ERROR.
+	// Clients branch on these: a full disk must not look like a server bug or
+	// the client retries forever, and rclone/Finder surface the text verbatim.
+	// The errno→NTSTATUS choices follow Samba's unix_dos_nt_errmap
+	// (source3/lib/errmap_unix.c), the de-facto reference for a POSIX-backed
+	// SMB server.
+	StatusObjectPathNotFound Status = 0xC000003A // ELOOP
+	StatusObjectNameInvalid  Status = 0xC0000033 // ENAMETOOLONG
+	StatusDirectoryNotEmpty  Status = 0xC0000101 // ENOTEMPTY
+	StatusTooManyOpenedFiles Status = 0xC000011F // EMFILE / ENFILE
+	StatusNotSameDevice      Status = 0xC00000D4 // EXDEV
+	StatusIODeviceError      Status = 0xC0000185 // EIO
+	StatusInvalidHandle      Status = 0xC0000008 // EBADF
+	StatusTooManyLinks       Status = 0xC0000265 // EMLINK
+
+	// StatusInvalidInfoClass is the mandated reply for an information class the
+	// server does not implement (MS-SMB2 §3.3.5.18 / MS-FSCC §2.4). Emitting a
+	// differently-shaped record instead makes the client parse garbage.
+	StatusInvalidInfoClass Status = 0xC0000003
+	// StatusInfoLengthMismatch is the mandated reply when the client's
+	// OutputBufferLength cannot hold even a single directory entry
+	// (MS-SMB2 §3.3.5.18). Answering STATUS_NO_MORE_FILES instead silently
+	// truncates the listing.
+	StatusInfoLengthMismatch Status = 0xC0000004
 )

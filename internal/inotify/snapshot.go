@@ -53,9 +53,20 @@ func diffSnapshot(dir string, before, after map[string]dirEntry) []InotifyEvent 
 		_ = ino
 		evs = append(evs, InotifyEvent{Path: join(name), Event: ev})
 	}
-	// modify: same name, same inode, changed mtime
+	// modify: same name still present. Two distinct cases:
+	//   - same inode, changed mtime: an ordinary in-place write.
+	//   - different inode: the name was replaced, which is what an atomic save
+	//     (write temp, rename over the target) looks like from here. The name
+	//     never appears or disappears, so without this the change is invisible
+	//     AND the watcher keeps watching the old, now-unlinked inode — every
+	//     later write to the file is then missed until something else in the
+	//     directory forces a rescan.
 	for name, a := range after {
-		if b, ok := before[name]; ok && b.ino == a.ino && b.mtime != a.mtime && !a.isDir {
+		b, ok := before[name]
+		if !ok || a.isDir {
+			continue
+		}
+		if b.ino != a.ino || b.mtime != a.mtime {
 			evs = append(evs, InotifyEvent{Path: join(name), Event: Modified})
 		}
 	}

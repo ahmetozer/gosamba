@@ -3,6 +3,7 @@ package smb2
 import (
 	"encoding/binary"
 	"fmt"
+	"unicode/utf16"
 )
 
 // Share types.
@@ -43,11 +44,15 @@ func decodeUTF16LE(b []byte) string {
 	if len(b)%2 != 0 {
 		b = b[:len(b)-1]
 	}
-	r := make([]rune, 0, len(b)/2)
+	u := make([]uint16, 0, len(b)/2)
 	for i := 0; i < len(b); i += 2 {
-		r = append(r, rune(uint16(b[i])|uint16(b[i+1])<<8))
+		u = append(u, uint16(b[i])|uint16(b[i+1])<<8)
 	}
-	return string(r)
+	// utf16.Decode combines surrogate pairs into a single rune. Treating each
+	// code unit as a rune instead would turn every non-BMP name (emoji, most
+	// CJK extensions) into two unpaired surrogates, which Go renders as U+FFFD
+	// — making such files unreachable and not round-tripping the name.
+	return string(utf16.Decode(u))
 }
 
 // TreeConnectResponse body.

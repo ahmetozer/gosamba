@@ -165,6 +165,10 @@ func TestHandleLock_ExclusiveConflict(t *testing.T) {
 	d := &Dispatcher{
 		Sessions: NewSessionTable(),
 		Log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		// A dispatcher without a lock manager cannot apply byte-range
+		// locks at all; give each test its own so they stay independent
+		// of the process-wide sharedLockManager.
+		locks: newLockManager(),
 	}
 
 	// Build a LOCK request body for f2 over 0–100 (exclusive, fail immediately).
@@ -227,6 +231,10 @@ func TestHandleLock_SuccessAndUnlock(t *testing.T) {
 	d := &Dispatcher{
 		Sessions: NewSessionTable(),
 		Log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		// A dispatcher without a lock manager cannot apply byte-range
+		// locks at all; give each test its own so they stay independent
+		// of the process-wide sharedLockManager.
+		locks: newLockManager(),
 	}
 
 	hdr := smb2.Header{
@@ -305,6 +313,10 @@ func TestHandleLock_MultiElementRollback(t *testing.T) {
 	d := &Dispatcher{
 		Sessions: NewSessionTable(),
 		Log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		// A dispatcher without a lock manager cannot apply byte-range
+		// locks at all; give each test its own so they stay independent
+		// of the process-wide sharedLockManager.
+		locks: newLockManager(),
 	}
 
 	// Two-element request:

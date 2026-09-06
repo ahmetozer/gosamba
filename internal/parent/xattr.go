@@ -3,7 +3,9 @@ package parent
 import (
 	"encoding/binary"
 	"errors"
+	"os"
 	"strings"
+	"syscall"
 
 	"golang.org/x/sys/unix"
 )
@@ -133,8 +135,30 @@ func readStreamXattr(path, stream string) ([]byte, error) {
 
 // writeStreamXattr persists data as the named stream's content. A zero-length
 // write still creates the attribute so the stream "exists".
+//
+// The write goes through a descriptor opened with O_NOFOLLOW where possible.
+// The path-based unix.Setxattr follows symlinks, so a symlink swapped in after
+// the CREATE-time ResolveSecure check would let a client's stream bytes land
+// on a file outside the share. A leaf that has become a symlink (ELOOP) is
+// refused outright; any other open failure — a file whose mode bits deny read
+// but not write, say — falls back to the path form, which is no worse than the
+// behaviour this replaced.
 func writeStreamXattr(path, stream string, data []byte) error {
-	err := unix.Setxattr(path, streamXattrName(stream), data, 0)
+	f, oerr := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	switch {
+	case oerr == nil:
+		defer f.Close()
+		return classifySetxattrErr(unix.Fsetxattr(int(f.Fd()), streamXattrName(stream), data, 0))
+	case errors.Is(oerr, syscall.ELOOP):
+		return oerr
+	}
+	return classifySetxattrErr(unix.Setxattr(path, streamXattrName(stream), data, 0))
+}
+
+// classifySetxattrErr normalizes a set-xattr failure: ENOTSUP (filesystem has
+// no xattr support) becomes errXattrUnsupported so callers can skip silently;
+// everything else is passed through so it can be reported to the client.
+func classifySetxattrErr(err error) error {
 	if err == nil {
 		return nil
 	}
@@ -142,6 +166,27 @@ func writeStreamXattr(path, stream string, data []byte) error {
 		return errXattrUnsupported
 	}
 	return err
+}
+
+// streamExists reports whether the named stream is currently stored on path.
+//
+// readStreamXattr cannot answer this: it maps "attribute not present" to
+// (nil, nil), which is indistinguishable from a stream that exists but holds
+// zero bytes — and CREATE has to tell those apart to honour FILE_OPEN vs
+// FILE_CREATE. A filesystem without xattr support returns errXattrUnsupported;
+// no stream can exist there.
+func streamExists(path, stream string) (bool, error) {
+	_, err := unix.Getxattr(path, streamXattrName(stream), nil)
+	if err == nil {
+		return true, nil
+	}
+	if isXattrNotFound(err) {
+		return false, nil
+	}
+	if errors.Is(err, unix.ENOTSUP) {
+		return false, errXattrUnsupported
+	}
+	return false, err
 }
 
 // removeStreamXattr deletes the named stream. A missing stream is not an error.
@@ -196,14 +241,19 @@ type eaInfo struct {
 
 // setEA persists an extended attribute under "user.<name>".
 func setEA(path, name string, val []byte) error {
-	err := unix.Setxattr(path, eaXattrName(name), val, 0)
-	if err == nil {
-		return nil
+	return classifySetxattrErr(unix.Setxattr(path, eaXattrName(name), val, 0))
+}
+
+// setEAOnFile is setEA against an already-open descriptor. SET_INFO runs on a
+// handle whose file CREATE opened with O_NOFOLLOW; writing the EA through that
+// descriptor keeps the guarantee, whereas the path-based form re-resolves and
+// would follow a symlink swapped in since. f is nil for directory handles,
+// which have no descriptor.
+func setEAOnFile(f *os.File, path, name string, val []byte) error {
+	if f == nil {
+		return setEA(path, name, val)
 	}
-	if errors.Is(err, unix.ENOTSUP) {
-		return errXattrUnsupported
-	}
-	return err
+	return classifySetxattrErr(unix.Fsetxattr(int(f.Fd()), eaXattrName(name), val, 0))
 }
 
 // listEAs enumerates user EAs on path, EXCLUDING our internal ADS storage

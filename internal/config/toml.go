@@ -27,7 +27,10 @@ const (
 //   - key = true | false
 //   - key = ["a", "b", ...] string arrays
 //
-// Unknown keys are silently ignored (matches BurntSushi default).
+// Unknown keys are silently ignored (matches BurntSushi default), with one
+// deliberate exception: an unknown key inside a [[user]] table is an error,
+// because a misspelled key there fails open rather than merely being ignored
+// (see applyUserKV).
 func decodeTOMLFile(path string, f *File) error {
 	fh, err := os.Open(path)
 	if err != nil {
@@ -279,7 +282,13 @@ func applyUserKV(u *FileUser, key, valStr string, lineNum int) error {
 			return err
 		}
 		u.AllowShares = arr
-		// unknown keys silently ignored
+	default:
+		// Unlike every other table, a typo here is a security bug rather than
+		// a cosmetic one, so [[user]] is strict. "nt_hsah" would leave the
+		// account with no hash and "allow_share" would leave allow_shares
+		// unset — which means every share. Both fail open, and both look
+		// perfectly fine in the config file. Refuse to start instead.
+		return fmt.Errorf("unknown key %q in [[user]] table", key)
 	}
 	return nil
 }
@@ -338,6 +347,10 @@ func parseStringArray(s string, lineNum int) ([]string, error) {
 	}
 	inner := strings.TrimSpace(s[1 : len(s)-1])
 	if inner == "" {
+		// Non-nil on purpose: an explicit "[]" must stay distinguishable from
+		// an absent key. Merge reads allow_shares == nil as "grant every
+		// share" and a non-nil empty slice as "grant nothing"; returning nil
+		// here would silently turn a deliberate revocation into a wildcard.
 		return []string{}, nil
 	}
 

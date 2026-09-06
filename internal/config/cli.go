@@ -81,7 +81,7 @@ func ParseCLI(args []string) (CLI, error) {
 	fs.StringVar(&liVal, "l", "", "listen address (short for --listen)")
 
 	nbVal := false
-	fs.BoolVar(&nbVal, "netbios", false, "also bind :139")
+	fs.BoolVar(&nbVal, "netbios", false, "NOT IMPLEMENTED — rejected at startup; nothing binds :139 (SMB2/3 uses :445)")
 
 	mdnsVal := true
 	fs.BoolVar(&mdnsVal, "mdns", true, "advertise SMB service via mDNS/Bonjour (default on)")
@@ -96,7 +96,7 @@ func ParseCLI(args []string) (CLI, error) {
 	fs.StringVar(&dtVal, "durable-timeout", "", "duration, e.g. 60s")
 
 	sdVal := ""
-	fs.StringVar(&sdVal, "state-dir", "", "runtime state directory")
+	fs.StringVar(&sdVal, "state-dir", "", "runtime state directory (reserved — parsed and stored but nothing reads it yet)")
 
 	pdVal := false
 	fs.BoolVar(&pdVal, "per-user-privdrop", false, "serve each connection in a worker process that drops to the authenticated user's uid/gid (requires root)")
@@ -162,6 +162,13 @@ func ParseCLI(args []string) (CLI, error) {
 		// uid/gid).
 		if len(parts) != 2 && len(parts) != 3 {
 			return CLI{}, fmt.Errorf("-u %q: must be smb_user:password[:system_user] (2 or 3 fields, got %d)", u, len(parts))
+		}
+		// An empty password would hash to the NT hash of "" — a real, valid
+		// hash that anyone can compute, so the account would accept logins
+		// from anybody. "-u alice:" is a typo, not a credential. The `gosamba
+		// hash` subcommand already refuses an empty password; match it.
+		if parts[1] == "" {
+			return CLI{}, fmt.Errorf("-u %q: password is empty", u)
 		}
 		cu := CLIUser{Name: parts[0], Password: parts[1]}
 		if len(parts) == 3 {
