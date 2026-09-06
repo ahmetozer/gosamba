@@ -509,13 +509,17 @@ func (d *Dispatcher) applyDurableAndLease(open *Open, dq durableRequest, lr leas
 	}
 
 	if lr.present {
-		// We grant only READ caching — see durable.go header note. We do not
-		// implement a lease-break state machine, so granting write/handle
-		// caching would be unsafe (we could not revoke it on a conflicting
-		// open). READ caching is always safe to honor.
+		// Grant NO caching (LEASE_NONE). A read-caching lease is a promise that
+		// the server will send a lease break before the file changes under the
+		// client; we implement no lease-break machinery (OPLOCK_BREAK is
+		// answered STATUS_NOT_SUPPORTED and nothing ever sends an unsolicited
+		// break), so a client that trusted a read lease would keep serving
+		// stale data indefinitely whenever another opener — or a process on the
+		// server itself — modified the file. Echoing LEASE_NONE keeps the
+		// client re-reading from the server, which is always correct.
 		ctxs = append(ctxs, smb2.CreateContext{
 			Name: tagRqLs,
-			Data: encodeRqLsResponse(lr.key, leaseReadCaching),
+			Data: encodeRqLsResponse(lr.key, leaseNone),
 		})
 	}
 

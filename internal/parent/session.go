@@ -89,9 +89,17 @@ type Session struct {
 	C2SCipherKey   []byte
 	ApplicationKey []byte
 
-	// GotEncrypted latches once the client has sent an encrypted frame.
-	// We then reply encrypted for the rest of the session.
-	GotEncrypted bool
+	// Authenticated latches true once SESSION_SETUP completes successfully
+	// (type-3 NTLM verified, or an accepted guest). Until then the session
+	// exists only to carry the multi-leg NTLM handshake; the dispatcher must
+	// refuse every non-SESSION_SETUP command on an unauthenticated session.
+	Authenticated bool
+
+	// gotEncrypted latches once the client has sent an encrypted frame.
+	// We then reply encrypted for the rest of the session. It is read from
+	// the CHANGE_NOTIFY async goroutine while the read loop may set it, so it
+	// is accessed atomically.
+	gotEncrypted atomic.Bool
 
 	pendingChallenge [8]byte
 
@@ -112,6 +120,15 @@ func (s *Session) initTables() {
 		s.nextTreeID.Store(1)
 	}
 }
+
+// SetGotEncrypted latches that the client has sent at least one encrypted
+// frame on this session. Safe to call concurrently with GotEncrypted.
+func (s *Session) SetGotEncrypted() { s.gotEncrypted.Store(true) }
+
+// GotEncrypted reports whether the client has sent an encrypted frame. It is
+// read from the CHANGE_NOTIFY async goroutine and written by the read loop,
+// so it is backed by an atomic.
+func (s *Session) GotEncrypted() bool { return s.gotEncrypted.Load() }
 
 func (s *Session) AddTree(share config.ShareConfig) *Tree {
 	s.mu.Lock()
@@ -404,6 +421,10 @@ func (h *SessionSetupHandler) handleType3(rw io.ReadWriter, hdr smb2.Header, typ
 	}
 	sess.User = *user
 	sess.IsGuest = isGuest
+	// Authentication is complete: the dispatcher may now serve commands on
+	// this session. (Set before writing the response so a pipelined follow-up
+	// request can never race ahead of the flag.)
+	sess.Authenticated = true
 
 	var sessFlags uint16
 	if isGuest {

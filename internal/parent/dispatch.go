@@ -33,6 +33,14 @@ type Dispatcher struct {
 	// locks is the per-OS byte-range lock manager backing handleLock/handleClose.
 	locks *lockManager
 
+	// RequireEncryption / RequireSigning mirror the server security policy.
+	// When set, an authenticated (non-guest) session's requests must arrive
+	// encrypted / signed respectively; otherwise they are rejected. This is
+	// what makes the "required" modes actually enforced on inbound traffic
+	// rather than merely advertised in NEGOTIATE.
+	RequireEncryption bool
+	RequireSigning    bool
+
 	// Chain state — set by handleCreate, consumed by the ServeConn loop
 	// to satisfy "previous handle" FileIDs in compound related ops.
 	LastCreatedFileID [16]byte
@@ -46,8 +54,9 @@ type Dispatcher struct {
 
 	// encryptChain is set by ServeConn when the inbound frame arrived
 	// inside an SMB3 transform header. All responses for this chain go
-	// back encrypted.
-	encryptChain bool
+	// back encrypted. It is read by the CHANGE_NOTIFY async goroutine (via
+	// writeFrame) while ServeConn sets it for the next chain, so it is atomic.
+	encryptChain atomic.Bool
 
 	// writeMu serializes writes to the connection so async goroutines
 	// (CHANGE_NOTIFY completion) don't corrupt frames the main dispatcher
@@ -55,6 +64,26 @@ type Dispatcher struct {
 	writeMu sync.Mutex
 	// nextAsyncID allocates AsyncIds for STATUS_PENDING responses.
 	nextAsyncID atomic.Uint64
+}
+
+// maxStreamSize bounds an in-memory alternate-data-stream / resource-fork
+// buffer. It caps client-driven allocation and, more importantly, keeps a
+// wire-supplied stream offset from going negative when narrowed to int. The
+// on-disk xattr store imposes its own (smaller) limit at CLOSE.
+const maxStreamSize = 64 << 20 // 64 MiB
+
+// encryptionExempt reports whether a command may arrive in cleartext even when
+// encryption is required. These carry no confidential share data: TREE_CONNECT
+// precedes the client learning the share's encryption policy, and the rest are
+// keepalive / teardown / async-control messages that real clients (go-smb2)
+// send unencrypted. They are still subject to the signing requirement.
+func encryptionExempt(cmd smb2.Command) bool {
+	switch cmd {
+	case smb2.CommandTreeConnect, smb2.CommandTreeDisconnect, smb2.CommandLogoff,
+		smb2.CommandEcho, smb2.CommandCancel, smb2.CommandOplockBreak:
+		return true
+	}
+	return false
 }
 
 // ResetChainState clears per-chain (per-TCP-frame) state.
@@ -75,13 +104,13 @@ func hasPreviousHandleSentinel(cmd smb2.Command, body []byte) bool {
 }
 
 // SetEncryptForChain marks whether the current inbound chain was encrypted.
-func (d *Dispatcher) SetEncryptForChain(b bool) { d.encryptChain = b }
+func (d *Dispatcher) SetEncryptForChain(b bool) { d.encryptChain.Store(b) }
 
 // writeFrame serializes outbound frames and applies SMB3 transform-header
 // encryption when the session demands it (or when the client encrypted us).
 func (d *Dispatcher) writeFrame(rw io.Writer, sess *Session, frame []byte) error {
 	if sess != nil && len(sess.S2CCipherKey) > 0 && d.Conn.Selection.Cipher != 0 &&
-		(sess.GotEncrypted || d.encryptChain) {
+		(sess.GotEncrypted() || d.encryptChain.Load()) {
 		enc, err := smb3.EncryptTransform(uint16(d.Conn.Selection.Cipher), sess.S2CCipherKey, sess.ID, frame)
 		if err != nil {
 			return err
@@ -140,18 +169,56 @@ func (d *Dispatcher) Dispatch(rw io.ReadWriter, hdr smb2.Header, body, frame []b
 		return false
 	}
 
-	// Verify inbound signature when client set FlagSigned. Frames that
-	// arrived inside a Transform header are already authenticated by the
-	// AEAD tag, so we skip the per-message check there.
-	if !d.encryptChain && hdr.Flags&smb2.FlagSigned != 0 && len(sess.SigningKey) > 0 {
-		if !smb3.VerifyMessage(uint16(d.Conn.Selection.SigningAlgo), sess.SigningKey, frame) {
-			d.Log.Warn("inbound signature mismatch — dropping",
-				"cmd", hdr.Command,
-				"msg_id", hdr.MessageID,
-				"session_id", hdr.SessionID,
-			)
+	// Refuse every command on a session that has not completed SESSION_SETUP.
+	// handleType1 registers the session (so the multi-leg NTLM handshake can
+	// find it) before any credentials are verified; without this gate an
+	// unauthenticated client could TREE_CONNECT to IPC$ and enumerate shares,
+	// or reach the DCERPC parser, with only a NEGOTIATE + type-1 sent.
+	if !sess.Authenticated {
+		d.Log.Warn("command on unauthenticated session — denying",
+			"cmd", hdr.Command, "session_id", hdr.SessionID)
+		d.respondError(rw, hdr, smb2.StatusAccessDenied, nil)
+		return false
+	}
+
+	encrypted := d.encryptChain.Load()
+
+	// Enforce the server's inbound security policy. Guests carry no session
+	// keys (they opted out of per-session crypto), so the requirements apply
+	// only to key-bearing (non-guest) sessions; a guest_ok share is an
+	// explicit decision to accept unauthenticated traffic.
+	if !sess.IsGuest && len(sess.SigningKey) > 0 {
+		// Require encryption for every message that can carry share data. The
+		// no-data control commands are exempt: TREE_CONNECT must precede the
+		// client learning the share's encryption policy, and ECHO/LOGOFF/
+		// TREE_DISCONNECT/CANCEL/OPLOCK_BREAK carry no confidential payload —
+		// go-smb2 (rclone) legitimately sends these in the clear. They remain
+		// signing-enforced below. A policy miss here is answered ACCESS_DENIED
+		// but does not drop the connection: a stray cleartext keepalive must
+		// not tear down an otherwise-healthy mount.
+		if d.RequireEncryption && !encrypted && !encryptionExempt(hdr.Command) {
+			d.Log.Warn("unencrypted request but encryption required — denying",
+				"cmd", hdr.Command, "session_id", hdr.SessionID)
 			d.respondError(rw, hdr, smb2.StatusAccessDenied, sess)
-			return false
+			return true
+		}
+		// Signing is subsumed by transform encryption (AEAD authenticates the
+		// whole message). For cleartext frames, a signature is mandatory when
+		// signing is required, and verified whenever one is present.
+		if !encrypted {
+			if d.RequireSigning || hdr.Flags&smb2.FlagSigned != 0 {
+				if hdr.Flags&smb2.FlagSigned == 0 ||
+					!smb3.VerifyMessage(uint16(d.Conn.Selection.SigningAlgo), sess.SigningKey, frame) {
+					d.Log.Warn("inbound signature missing or invalid — dropping",
+						"cmd", hdr.Command,
+						"msg_id", hdr.MessageID,
+						"session_id", hdr.SessionID,
+						"required", d.RequireSigning,
+					)
+					d.respondError(rw, hdr, smb2.StatusAccessDenied, sess)
+					return false
+				}
+			}
 		}
 	}
 
@@ -218,7 +285,7 @@ func (d *Dispatcher) respondSuccess(rw io.ReadWriter, hdr smb2.Header, sess *Ses
 	// already authenticates the frame, and signing under encryption is
 	// disallowed for the wrapped message (MS-SMB2 §3.3.4.1.4).
 	willEncrypt := sess != nil && len(sess.S2CCipherKey) > 0 && d.Conn.Selection.Cipher != 0 &&
-		(sess.GotEncrypted || d.encryptChain)
+		(sess.GotEncrypted() || d.encryptChain.Load())
 	sign := !willEncrypt && sess != nil && len(sess.SigningKey) > 0
 	out := d.buildResponse(hdr, sess, smb2.StatusSuccess, body, sign)
 	d.lastChainStatus = smb2.StatusSuccess
@@ -229,7 +296,7 @@ func (d *Dispatcher) respondSuccess(rw io.ReadWriter, hdr smb2.Header, sess *Ses
 func (d *Dispatcher) respondError(rw io.ReadWriter, hdr smb2.Header, status smb2.Status, sess *Session) {
 	errBody := []byte{0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
 	willEncrypt := sess != nil && len(sess.S2CCipherKey) > 0 && d.Conn.Selection.Cipher != 0 &&
-		(sess.GotEncrypted || d.encryptChain)
+		(sess.GotEncrypted() || d.encryptChain.Load())
 	signed := !willEncrypt && sess != nil && len(sess.SigningKey) > 0
 	out := d.buildResponse(hdr, sess, status, errBody, signed)
 	d.lastChainStatus = status
@@ -329,6 +396,14 @@ func (d *Dispatcher) handleTreeConnect(rw io.ReadWriter, hdr smb2.Header, body [
 	if share.ReadOnly {
 		shareFlags = 0x00000000 // MANUAL_CACHING
 	}
+	if d.RequireEncryption {
+		// SMB2_SHAREFLAG_ENCRYPT_DATA: tell the client that traffic on this
+		// tree must be encrypted. Clients (go-smb2/rclone included) encrypt
+		// per-tree based on this flag, not on the global NEGOTIATE cap alone;
+		// without it they keep sending cleartext and our inbound encryption
+		// check would reject every post-TREE_CONNECT request.
+		shareFlags |= 0x00008000
+	}
 	maximalAccess := uint32(0x001F01FF) // generic all
 	if share.ReadOnly {
 		maximalAccess = 0x001200A9 // read + execute
@@ -385,7 +460,7 @@ func (d *Dispatcher) respondSuccessWithTreeID(rw io.ReadWriter, hdr smb2.Header,
 	_ = smb2.EncodeHeader(out[:smb2.HeaderSize], respHdr)
 	copy(out[smb2.HeaderSize:], body)
 	willEncrypt := len(sess.S2CCipherKey) > 0 && d.Conn.Selection.Cipher != 0 &&
-		(sess.GotEncrypted || d.encryptChain)
+		(sess.GotEncrypted() || d.encryptChain.Load())
 	if !willEncrypt && len(sess.SigningKey) > 0 {
 		smb3.SignMessage(uint16(d.Conn.Selection.SigningAlgo), sess.SigningKey, out)
 	}
@@ -789,19 +864,28 @@ func (d *Dispatcher) handleRead(rw io.ReadWriter, hdr smb2.Header, body []byte, 
 		return true
 	}
 	if open.IsStream {
-		off := int(req.Offset)
-		if off >= len(open.streamBuf) {
+		// Compare in uint64 before narrowing to int: a wire offset past 2^63
+		// would otherwise become negative and panic the streamBuf slice.
+		if req.Offset >= uint64(len(open.streamBuf)) {
 			d.respondError(rw, hdr, smb2.StatusEndOfFile, sess)
 			return true
 		}
+		off := int(req.Offset)
 		end := off + int(req.Length)
-		if end > len(open.streamBuf) {
+		if end > len(open.streamBuf) || end < off {
 			end = len(open.streamBuf)
 		}
 		d.respondSuccess(rw, hdr, sess, smb2.EncodeReadResponse(smb2.ReadResponse{Data: open.streamBuf[off:end]}))
 		return true
 	}
 	if open.File == nil {
+		d.respondError(rw, hdr, smb2.StatusInvalidParameter, sess)
+		return true
+	}
+	// Clamp the request to the negotiated MaxReadSize so a single READ can't
+	// force an arbitrary (up to 4 GiB) allocation. A compliant client never
+	// asks for more than it negotiated.
+	if maxIO := d.Conn.MaxIOSize; maxIO != 0 && req.Length > maxIO {
 		d.respondError(rw, hdr, smb2.StatusInvalidParameter, sess)
 		return true
 	}
@@ -850,6 +934,16 @@ func (d *Dispatcher) handleWrite(rw io.ReadWriter, hdr smb2.Header, body []byte,
 		return true
 	}
 	if open.IsStream {
+		// Streams are held wholly in memory and persisted as an xattr, so a
+		// huge offset is both meaningless and dangerous: int(req.Offset) on a
+		// >2^63 value goes negative (panicking the slice), and a large offset
+		// would drive an unbounded make([]byte, end). Reject anything past the
+		// stream size cap before touching the buffer.
+		if req.Offset > maxStreamSize || uint64(len(req.Data)) > maxStreamSize ||
+			req.Offset+uint64(len(req.Data)) > maxStreamSize {
+			d.respondError(rw, hdr, smb2.StatusDiskFull, sess)
+			return true
+		}
 		off := int(req.Offset)
 		end := off + len(req.Data)
 		if end > len(open.streamBuf) {
@@ -1993,7 +2087,7 @@ func (d *Dispatcher) sendAsync(rw io.ReadWriter, reqHdr smb2.Header, sess *Sessi
 	_ = smb2.EncodeAsyncHeader(out[:smb2.HeaderSize], respHdr, asyncID)
 	copy(out[smb2.HeaderSize:], body)
 	willEncrypt := sess != nil && len(sess.S2CCipherKey) > 0 && d.Conn.Selection.Cipher != 0 &&
-		sess.GotEncrypted
+		sess.GotEncrypted()
 	if !willEncrypt && sess != nil && len(sess.SigningKey) > 0 {
 		smb3.SignMessage(uint16(d.Conn.Selection.SigningAlgo), sess.SigningKey, out)
 	}

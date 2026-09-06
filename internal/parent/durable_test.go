@@ -367,7 +367,10 @@ func TestHandleCreate_LeaseEcho(t *testing.T) {
 	if !hasContext(rctxs, tagRqLs) {
 		t.Fatalf("response did not echo RqLs")
 	}
-	// Verify the granted state is exactly READ caching (we never grant W/H).
+	// Verify the granted state is LEASE_NONE. We implement no lease-break
+	// machinery, so granting any caching (even READ) would let a client serve
+	// stale data after another opener modifies the file; echoing LEASE_NONE
+	// keeps it re-reading from the server.
 	var granted uint32
 	smb2.IterateCreateContexts(rctxs, func(c smb2.CreateContext) bool {
 		if eqTag(c.Name, tagRqLs) && len(c.Data) >= 20 {
@@ -376,8 +379,8 @@ func TestHandleCreate_LeaseEcho(t *testing.T) {
 		}
 		return true
 	})
-	if granted != leaseReadCaching {
-		t.Fatalf("granted lease state=0x%X, want 0x%X (READ only)", granted, leaseReadCaching)
+	if granted != leaseNone {
+		t.Fatalf("granted lease state=0x%X, want 0x%X (LEASE_NONE)", granted, leaseNone)
 	}
 }
 

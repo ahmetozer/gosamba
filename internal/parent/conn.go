@@ -115,11 +115,13 @@ func ServeConn(ctx context.Context, c net.Conn, log *slog.Logger, maxFrame uint3
 		Log:      log,
 	}
 	dispatcher := &Dispatcher{
-		Conn:     conn,
-		Sessions: sessions,
-		Shares:   opts.Shares,
-		Log:      log,
-		locks:    sharedLockManager,
+		Conn:              conn,
+		Sessions:          sessions,
+		Shares:            opts.Shares,
+		Log:               log,
+		locks:             sharedLockManager,
+		RequireEncryption: opts.RequireEncryption,
+		RequireSigning:    opts.RequireSigning,
 	}
 
 	for {
@@ -156,7 +158,7 @@ func ServeConn(ctx context.Context, c net.Conn, log *slog.Logger, maxFrame uint3
 			}
 			frame = plain
 			encryptResp = true
-			sess.GotEncrypted = true
+			sess.SetGotEncrypted()
 		}
 
 		// Walk the (possibly compound) chain, dispatching each message over
@@ -179,6 +181,15 @@ func ServeConn(ctx context.Context, c net.Conn, log *slog.Logger, maxFrame uint3
 			}
 			end := len(frame)
 			if hdr.NextCommand != 0 {
+				// NextCommand is the byte offset from this message's header to
+				// the next one in the chain. It must clear this message's own
+				// 64-byte header and must not run past the frame; a value in
+				// (0, HeaderSize) would make body = msgBytes[HeaderSize:] slice
+				// out of range and panic the whole (unauthenticated) connection.
+				if hdr.NextCommand < smb2.HeaderSize {
+					log.Warn("NextCommand shorter than header", "next_command", hdr.NextCommand)
+					return
+				}
 				end = off + int(hdr.NextCommand)
 				if end > len(frame) {
 					log.Warn("NextCommand overruns frame", "next_command", hdr.NextCommand, "len", len(frame))
