@@ -54,7 +54,11 @@ func (w *Watcher) handleEvent(ev systemInotifyEvent, fullPath string) {
 	switch {
 	case ev.Mask&unix.IN_CREATE != 0:
 		if fi, err := os.Stat(fullPath); err == nil && fi.IsDir() {
-			_ = w.watchDir(fullPath)
+			// Only a recursive watcher follows the new directory; a
+			// non-recursive one reports the create and stops there.
+			if w.recursive {
+				_ = w.watchDir(fullPath)
+			}
 			w.send(InotifyEvent{Path: fullPath, Event: FolderCreate})
 		} else {
 			w.send(InotifyEvent{Path: fullPath, Event: FileCreate})

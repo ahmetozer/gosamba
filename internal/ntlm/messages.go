@@ -150,9 +150,24 @@ func DecodeAuthenticate(b []byte) (AuthenticateMessage, error) {
 	return m, nil
 }
 
+// smallestPayloadOffset returns the lowest offset any non-empty payload field
+// points at, i.e. where the message's variable-length section begins. The
+// caller uses it to tell whether the fixed part is long enough to hold a MIC.
+//
+// The offsets below are the *starts* of the six payload field descriptors
+// (LmChallengeResponse, NtChallengeResponse, DomainName, UserName,
+// Workstation, EncryptedRandomSessionKey), each laid out as
+// len(2) maxlen(2) offset(4) — the same list read() is called with. They used
+// to be given as 16, 24, ... (each descriptor's *offset* word), which made this
+// read a length out of one descriptor's offset field and an offset out of the
+// next descriptor's length words. The garbage that produced usually came out
+// below 88, so HasMIC was reported false for messages that did carry a MIC.
 func smallestPayloadOffset(b []byte) int {
 	min := int(^uint(0) >> 1)
-	for _, off := range []int{16, 24, 32, 40, 48, 56} {
+	for _, off := range []int{12, 20, 28, 36, 44, 52} {
+		if len(b) < off+8 {
+			break
+		}
 		l := int(binary.LittleEndian.Uint16(b[off:]))
 		o := int(binary.LittleEndian.Uint32(b[off+4:]))
 		if l > 0 && o < min {

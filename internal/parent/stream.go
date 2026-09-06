@@ -93,7 +93,11 @@ func (d *Dispatcher) handleCreateNamedStream(rw io.ReadWriter, hdr smb2.Header, 
 			return true
 		}
 	}
-	osPath, err := vfs.ResolveSecure(tree.Share.Path, baseName)
+	// Use normalization-insensitive resolution, like every other CREATE path.
+	// Plain ResolveSecure misses a base file stored NFD-encoded (the norm on
+	// macOS) when the client addresses it in NFC, so a stream on such a file
+	// looked like "base does not exist" and the whole open failed.
+	osPath, err := vfs.ResolveSecureNorm(tree.Share.Path, baseName)
 	if err != nil {
 		d.respondError(rw, hdr, smb2.StatusAccessDenied, sess)
 		return true
@@ -108,6 +112,70 @@ func (d *Dispatcher) handleCreateNamedStream(rw io.ReadWriter, hdr smb2.Header, 
 	if st.IsDir() {
 		// Directories don't have $DATA streams. Samba returns FILE_IS_A_DIRECTORY.
 		d.respondError(rw, hdr, smb2.StatusFileIsADirectory, sess)
+		return true
+	}
+
+	// Honour CreateDisposition (MS-SMB2 §3.3.5.9 / MS-FSCC): a named stream is
+	// an object in its own right, so FILE_OPEN of a stream that was never
+	// written must fail with STATUS_OBJECT_NAME_NOT_FOUND and FILE_CREATE of
+	// one that already exists must fail with STATUS_OBJECT_NAME_COLLISION.
+	// Accepting every disposition silently materialised an empty stream on any
+	// probe, so clients could never tell "no such stream" from "empty stream".
+	exists, existErr := streamExists(osPath, streamName)
+	switch {
+	case errors.Is(existErr, errXattrUnsupported):
+		// The filesystem cannot store streams at all (FAT/exFAT, some network
+		// mounts). Reporting NOT_FOUND for every open would break clients that
+		// merely probe; stay permissive, exactly as before, and let CLOSE drop
+		// the data.
+		exists = true
+	case existErr != nil:
+		d.Log.Warn("stream existence check failed", "path", osPath, "stream", streamName, "err", existErr)
+		d.respondError(rw, hdr, statusFromErr(existErr), sess)
+		return true
+	}
+	// AFP_AfpInfo is always presented: macOS reads it during a copy and aborts
+	// the copy on a failed/empty read, so we synthesize a valid blob below
+	// rather than reporting the stream missing.
+	if isAFPInfoStream(streamName) {
+		exists = true
+	}
+
+	// truncatesStream reports whether a disposition replaces the stream's
+	// contents rather than opening them (MS-FSCC: SUPERSEDE, OVERWRITE and
+	// OVERWRITE_IF all start from an empty file).
+	truncatesStream := func(disp uint32) bool {
+		switch disp {
+		case smb2.CreateDispositionSupersede,
+			smb2.CreateDispositionOverwrite,
+			smb2.CreateDispositionOverwriteIf:
+			return true
+		}
+		return false
+	}
+
+	createAction := uint32(smb2.CreateActionOpened)
+	if truncatesStream(req.CreateDisposition) && exists {
+		createAction = smb2.CreateActionOverwritten
+	}
+	switch req.CreateDisposition {
+	case smb2.CreateDispositionOpen, smb2.CreateDispositionOverwrite:
+		if !exists {
+			d.respondError(rw, hdr, smb2.StatusObjectNameNotFound, sess)
+			return true
+		}
+	case smb2.CreateDispositionCreate:
+		if exists {
+			d.respondError(rw, hdr, smb2.StatusObjectNameCollision, sess)
+			return true
+		}
+		createAction = smb2.CreateActionCreated
+	case smb2.CreateDispositionOpenIf, smb2.CreateDispositionOverwriteIf, smb2.CreateDispositionSupersede:
+		if !exists {
+			createAction = smb2.CreateActionCreated
+		}
+	default:
+		d.respondError(rw, hdr, smb2.StatusInvalidParameter, sess)
 		return true
 	}
 
@@ -130,6 +198,16 @@ func (d *Dispatcher) handleCreateNamedStream(rw io.ReadWriter, hdr smb2.Header, 
 	} else if !errors.Is(rerr, errXattrUnsupported) {
 		d.Log.Warn("stream xattr read failed", "path", osPath, "stream", streamName, "err", rerr)
 	}
+	// A truncating disposition must start the stream empty. Without this a
+	// short write over a longer existing stream leaves the old tail behind:
+	// the buffer is loaded from the xattr, the write overwrites only its
+	// prefix, and CLOSE flushes prefix+stale-tail back. Do this after the
+	// load (which would otherwise re-populate it) and before the AFP_AfpInfo
+	// fabrication, so a superseded AFP stream still gets a valid 60-byte blob.
+	if truncatesStream(req.CreateDisposition) {
+		open.streamBuf = nil
+		open.streamWritten = true
+	}
 	// Apple's AFP_AfpInfo metadata stream must always present a valid 60-byte
 	// blob. macOS reads it during a copy; returning 0 bytes makes Finder abort
 	// before writing the file data. Fabricate one when nothing is stored yet —
@@ -148,7 +226,7 @@ func (d *Dispatcher) handleCreateNamedStream(rw io.ReadWriter, hdr smb2.Header, 
 
 	now := filetimeFromTime(time.Now())
 	resp := smb2.EncodeCreateResponse(smb2.CreateResponse{
-		CreateAction:   smb2.CreateActionOpened,
+		CreateAction:   createAction,
 		CreationTime:   now,
 		LastAccessTime: now,
 		LastWriteTime:  now,

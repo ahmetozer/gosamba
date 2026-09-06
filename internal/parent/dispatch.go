@@ -16,6 +16,8 @@ import (
 	"time"
 	"unicode/utf16"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/ahmetozer/gosamba/internal/config"
 	"github.com/ahmetozer/gosamba/internal/inotify"
 	"github.com/ahmetozer/gosamba/internal/smb2"
@@ -573,10 +575,22 @@ type syntheticDirEntry struct {
 	info os.FileInfo
 }
 
-func (s syntheticDirEntry) Name() string               { return s.name }
-func (s syntheticDirEntry) IsDir() bool                { return true }
-func (s syntheticDirEntry) Type() os.FileMode          { return os.ModeDir }
-func (s syntheticDirEntry) Info() (os.FileInfo, error) { return s.info, nil }
+func (s syntheticDirEntry) Name() string      { return s.name }
+func (s syntheticDirEntry) IsDir() bool       { return true }
+func (s syntheticDirEntry) Type() os.FileMode { return os.ModeDir }
+
+// Info never hands back a nil os.FileInfo. The "." / ".." entries are built
+// from an os.Lstat that can fail (the directory can be renamed or removed
+// between the ReadDir and the stat), and a nil interface here would be
+// dereferenced by encodeDirRecord — panicking the whole server process, since
+// nothing in the serve path recovers. Reporting an error instead makes the
+// enumerator skip the entry.
+func (s syntheticDirEntry) Info() (os.FileInfo, error) {
+	if s.info == nil {
+		return nil, os.ErrNotExist
+	}
+	return s.info, nil
+}
 
 func (d *Dispatcher) respondSuccessWithTreeID(rw io.ReadWriter, hdr smb2.Header, sess *Session, body []byte, treeID uint32) {
 	respHdr := smb2.Header{
@@ -1023,7 +1037,65 @@ func (d *Dispatcher) handleCreate(rw io.ReadWriter, hdr smb2.Header, body []byte
 	return true
 }
 
+// statusFromErr maps a filesystem error to the NTSTATUS a client expects.
+//
+// Getting this right is directly user-visible: clients branch on the status to
+// decide whether to retry, to surface "disk full", or to give up. Collapsing
+// every errno to STATUS_INTERNAL_ERROR makes a full disk look like a server
+// bug, and makes rmdir-on-non-empty look unrecoverable.
+//
+// The errno→NTSTATUS table follows Samba's unix_dos_nt_errmap
+// (source3/lib/errmap_unix.c) so we behave like the reference POSIX-backed SMB
+// server. errors.Is unwraps the *os.PathError / *os.LinkError wrappers the os
+// package returns.
 func statusFromErr(err error) smb2.Status {
+	if err == nil {
+		return smb2.StatusSuccess
+	}
+	// The specific errno tests run first. The os.Is* predicates below are
+	// deliberately coarse — syscall.Errno.Is folds ENOTEMPTY into fs.ErrExist,
+	// for instance — so consulting them first would report a non-empty
+	// directory as OBJECT_NAME_COLLISION.
+	switch {
+	// ENOSPC/EDQUOT/EFBIG all mean "the write cannot be stored". Reporting
+	// DISK_FULL lets the client tell the user why instead of retrying.
+	case errors.Is(err, syscall.ENOSPC), errors.Is(err, syscall.EDQUOT), errors.Is(err, syscall.EFBIG):
+		return smb2.StatusDiskFull
+	case errors.Is(err, syscall.ENOTEMPTY):
+		return smb2.StatusDirectoryNotEmpty
+	case errors.Is(err, syscall.EISDIR):
+		return smb2.StatusFileIsADirectory
+	case errors.Is(err, syscall.ENOTDIR):
+		return smb2.StatusNotADirectory
+	case errors.Is(err, syscall.EMFILE), errors.Is(err, syscall.ENFILE):
+		return smb2.StatusTooManyOpenedFiles
+	// Samba maps a read-only filesystem to ACCESS_DENIED rather than
+	// MEDIA_WRITE_PROTECTED; every client already handles ACCESS_DENIED.
+	case errors.Is(err, syscall.EROFS):
+		return smb2.StatusAccessDenied
+	case errors.Is(err, syscall.ENAMETOOLONG):
+		return smb2.StatusObjectNameInvalid
+	case errors.Is(err, syscall.EXDEV):
+		return smb2.StatusNotSameDevice
+	// ELOOP means a path component was a symlink loop (or O_NOFOLLOW hit a
+	// symlink). Samba reports it as a path lookup failure.
+	case errors.Is(err, syscall.ELOOP):
+		return smb2.StatusObjectPathNotFound
+	case errors.Is(err, syscall.EMLINK):
+		return smb2.StatusTooManyLinks
+	case errors.Is(err, syscall.ENOMEM), errors.Is(err, syscall.ENOBUFS):
+		return smb2.StatusInsufficientResources
+	case errors.Is(err, syscall.EIO):
+		return smb2.StatusIODeviceError
+	case errors.Is(err, syscall.EBADF):
+		return smb2.StatusInvalidHandle
+	case errors.Is(err, syscall.EINVAL):
+		return smb2.StatusInvalidParameter
+	case errors.Is(err, syscall.ENOSYS), errors.Is(err, syscall.ENOTSUP):
+		return smb2.StatusNotSupported
+	}
+	// Fall back to the portable sentinels (fs.ErrNotExist, fs.ErrPermission,
+	// fs.ErrExist) for errors that carry no errno at all.
 	switch {
 	case os.IsNotExist(err):
 		return smb2.StatusObjectNameNotFound
@@ -1231,7 +1303,17 @@ func (d *Dispatcher) handleSetInfo(rw io.ReadWriter, hdr smb2.Header, body []byt
 		// stream are accepted silently.
 		switch {
 		case req.InfoType == smb2.InfoTypeFile && req.FileInfoClass == smb2.FileEndOfFileInformation && len(req.Buffer) >= 8:
-			size := int(binary.LittleEndian.Uint64(req.Buffer[0:]))
+			// The size is client-chosen and drives a make() on an in-memory
+			// buffer, so it needs exactly the cap the stream WRITE path
+			// already applies — otherwise one SET_INFO makes the server
+			// allocate terabytes. Compare as uint64 first: int() of a value
+			// past 2^63 goes negative and would slip through as "truncate".
+			wire := binary.LittleEndian.Uint64(req.Buffer[0:])
+			if wire > maxStreamSize {
+				d.respondError(rw, hdr, smb2.StatusDiskFull, sess)
+				return true
+			}
+			size := int(wire)
 			switch {
 			case size <= 0:
 				open.streamBuf = nil
@@ -1269,7 +1351,7 @@ func (d *Dispatcher) handleSetInfo(rw io.ReadWriter, hdr smb2.Header, body []byt
 			return true
 		}
 		size := int64(binary.LittleEndian.Uint64(req.Buffer[0:]))
-		if err := os.Truncate(open.Path, size); err != nil {
+		if err := truncateOpen(open, size); err != nil {
 			d.respondError(rw, hdr, statusFromErr(err), sess)
 			return true
 		}
@@ -1320,7 +1402,7 @@ func (d *Dispatcher) handleSetInfo(rw io.ReadWriter, hdr smb2.Header, body []byt
 		// silently (matching the prior accept-and-drop behavior) so clients
 		// don't conclude the handle is broken.
 		for _, ea := range parseFullEaList(req.Buffer) {
-			if err := setEA(open.Path, ea.Name, ea.Value); err != nil {
+			if err := setEAOnFile(open.File, open.Path, ea.Name, ea.Value); err != nil {
 				if errors.Is(err, errXattrUnsupported) {
 					break
 				}
@@ -1329,7 +1411,9 @@ func (d *Dispatcher) handleSetInfo(rw io.ReadWriter, hdr smb2.Header, body []byt
 			}
 		}
 	case smb2.FileBasicInformationSet:
-		// Best-effort: only LastWriteTime via os.Chtimes if non-zero/non-(-1).
+		// Only LastWriteTime/LastAccessTime are applied; POSIX has no setter
+		// for CreationTime or ChangeTime, and a 0 / -1 field means "leave
+		// unchanged" (MS-FSCC §2.4.7).
 		if len(req.Buffer) >= 32 {
 			lastWrite := int64(binary.LittleEndian.Uint64(req.Buffer[16:]))
 			lastAccess := int64(binary.LittleEndian.Uint64(req.Buffer[8:]))
@@ -1339,7 +1423,15 @@ func (d *Dispatcher) handleSetInfo(rw io.ReadWriter, hdr smb2.Header, body []byt
 				if lastAccess > 0 && lastAccess != -1 {
 					at = timeFromFiletime(uint64(lastAccess))
 				}
-				_ = os.Chtimes(open.Path, at, wt)
+				// Report a failed timestamp write instead of swallowing it.
+				// rclone compares modification times to decide whether a file
+				// still needs uploading; answering SUCCESS for a time we never
+				// set makes it treat a stale copy as up to date indefinitely.
+				if err := setTimesOnOpen(open, at, wt); err != nil {
+					d.Log.Warn("set-info: setting times failed", "path", open.Path, "err", err)
+					d.respondError(rw, hdr, statusFromErr(err), sess)
+					return true
+				}
 			}
 		}
 	default:
@@ -1349,6 +1441,37 @@ func (d *Dispatcher) handleSetInfo(rw io.ReadWriter, hdr smb2.Header, body []byt
 	}
 	d.respondSuccess(rw, hdr, sess, smb2.EncodeSetInfoResponse())
 	return true
+}
+
+// truncateOpen resizes the file behind an Open.
+//
+// It uses the descriptor CREATE already opened with O_NOFOLLOW rather than
+// re-resolving the path: os.Truncate follows symlinks, so a symlink swapped in
+// between CREATE and this SET_INFO would redirect the resize to whatever it
+// points at, bypassing the O_NOFOLLOW protection on the open. Directory
+// handles carry no descriptor and fall back to the path (where truncate is
+// EISDIR anyway).
+func truncateOpen(open *Open, size int64) error {
+	if open.File != nil {
+		return open.File.Truncate(size)
+	}
+	return os.Truncate(open.Path, size)
+}
+
+// setTimesOnOpen applies access/modification times to the file behind an Open.
+//
+// os.Chtimes resolves the path and follows symlinks, which reopens the TOCTOU
+// window that CREATE's O_NOFOLLOW closed. utimensat with AT_SYMLINK_NOFOLLOW
+// never traverses a symlink at the leaf and, unlike futimes(2), keeps the full
+// nanosecond resolution the client's 100 ns FILETIME deserves — a microsecond
+// rounding would make the mtime the client reads back differ from the one it
+// set.
+func setTimesOnOpen(open *Open, atime, mtime time.Time) error {
+	ts := []unix.Timespec{
+		unix.NsecToTimespec(atime.UnixNano()),
+		unix.NsecToTimespec(mtime.UnixNano()),
+	}
+	return unix.UtimesNanoAt(unix.AT_FDCWD, open.Path, ts, unix.AT_SYMLINK_NOFOLLOW)
 }
 
 func decodeUTF16LE(b []byte) string {
@@ -1412,20 +1535,30 @@ func (d *Dispatcher) handleClose(rw io.ReadWriter, hdr smb2.Header, body []byte,
 		// the stream "exists". ENOTSUP (no xattr support) is tolerated silently.
 		if open.DeleteOnClose {
 			if err := removeStreamXattr(open.Path, open.StreamName); err != nil && !errors.Is(err, errXattrUnsupported) {
+				// The client asked for the stream to be gone; if it isn't,
+				// say so rather than reporting a delete that never happened.
 				d.Log.Warn("stream delete-on-close failed", "path", open.Path, "stream", open.StreamName, "err", err)
+				d.respondError(rw, hdr, statusFromErr(err), sess)
+				return true
 			}
 		} else if open.streamSynthetic && !open.streamWritten {
 			// A fabricated blob (e.g. empty AFP_AfpInfo) the client only read —
 			// don't persist it, so we don't litter the file with metadata xattrs.
 		} else if err := writeStreamXattr(open.Path, open.StreamName, open.streamBuf); err != nil && !errors.Is(err, errXattrUnsupported) {
+			// This is the only point at which stream bytes reach disk, so a
+			// swallowed error here loses everything the client wrote while
+			// CLOSE still reports SUCCESS. Every failure must be surfaced.
+			//
 			// Linux user.* xattrs are size-limited (~64 KiB on ext4). A resource
-			// fork larger than that yields E2BIG — map to STATUS_DISK_FULL rather
-			// than silently losing data.
+			// fork larger than that yields E2BIG — map to STATUS_DISK_FULL,
+			// which is the closest "your data did not fit" status.
+			d.Log.Warn("stream flush failed", "path", open.Path, "stream", open.StreamName, "err", err)
 			if errors.Is(err, syscall.E2BIG) {
 				d.respondError(rw, hdr, smb2.StatusDiskFull, sess)
 				return true
 			}
-			d.Log.Warn("stream flush failed", "path", open.Path, "stream", open.StreamName, "err", err)
+			d.respondError(rw, hdr, statusFromErr(err), sess)
+			return true
 		}
 		now := filetimeFromTime(time.Now())
 		d.respondSuccess(rw, hdr, sess, smb2.EncodeCloseResponse(smb2.CloseResponse{
@@ -1441,12 +1574,27 @@ func (d *Dispatcher) handleClose(rw io.ReadWriter, hdr smb2.Header, body []byte,
 	}
 	if open.DeleteOnClose {
 		// Never let DELETE_ON_CLOSE on the tree root remove the shared
-		// directory itself — that would take the whole share offline.
+		// directory itself — that would take the whole share offline. The
+		// refusal has to be visible: a SUCCESS here would tell the client the
+		// share directory is gone when it is not.
 		if open.Tree != nil && open.Tree.Share.Path != "" &&
 			filepath.Clean(open.Path) == filepath.Clean(open.Tree.Share.Path) {
 			d.Log.Warn("refusing delete-on-close of the share root", "path", open.Path)
-		} else if err := os.Remove(open.Path); err != nil {
+			d.respondError(rw, hdr, smb2.StatusAccessDenied, sess)
+			return true
+		}
+		// A failed unlink must not be reported as a successful CLOSE: the
+		// client (rclone especially) records the file as deleted and never
+		// retries, while the file is still on disk. Surface the real reason —
+		// STATUS_DIRECTORY_NOT_EMPTY for a populated directory, ACCESS_DENIED
+		// for a sticky/read-only parent, and so on.
+		//
+		// An already-vanished path is not an error: the client's intent (the
+		// name is gone) holds either way.
+		if err := os.Remove(open.Path); err != nil && !os.IsNotExist(err) {
 			d.Log.Warn("delete-on-close failed", "path", open.Path, "err", err)
+			d.respondError(rw, hdr, statusFromErr(err), sess)
+			return true
 		}
 	}
 	st, _ := os.Lstat(open.Path)
@@ -1494,6 +1642,27 @@ func (d *Dispatcher) handleQueryDirectory(rw io.ReadWriter, hdr smb2.Header, bod
 		"pattern", req.FileName,
 		"buf_len", req.OutputBufferLength,
 	)
+	// OutputBufferLength comes straight off the wire and is used as an
+	// allocation size, so an unclamped value lets one request ask for up to
+	// 4 GiB. MS-SMB2 §3.3.5.18 says a request whose OutputBufferLength exceeds
+	// Connection.MaxTransactSize is failed with STATUS_INVALID_PARAMETER; a
+	// compliant client never asks for more than it negotiated. Mirrors the
+	// READ length clamp in handleRead.
+	if d.Conn != nil && d.Conn.MaxIOSize != 0 && req.OutputBufferLength > d.Conn.MaxIOSize {
+		d.Log.Warn("query-dir: output buffer exceeds negotiated max",
+			"requested", req.OutputBufferLength, "max", d.Conn.MaxIOSize)
+		d.respondError(rw, hdr, smb2.StatusInvalidParameter, sess)
+		return true
+	}
+	// Reject an information class we have no encoder for *before* enumerating.
+	// Falling through to a differently-shaped record makes the client parse
+	// garbage; MS-SMB2 §3.3.5.18 mandates STATUS_INVALID_INFO_CLASS instead.
+	if !supportedDirInfoClass(req.FileInformationClass) {
+		d.Log.Warn("query-dir: unsupported info class",
+			"class", req.FileInformationClass, "path", open.Path)
+		d.respondError(rw, hdr, smb2.StatusInvalidInfoClass, sess)
+		return true
+	}
 	if req.Flags&smb2.QueryDirRestartScans != 0 || open.dirEntries == nil {
 		entries, err := os.ReadDir(open.Path)
 		if err != nil {
@@ -1501,17 +1670,30 @@ func (d *Dispatcher) handleQueryDirectory(rw io.ReadWriter, hdr smb2.Header, bod
 			d.respondError(rw, hdr, statusFromErr(err), sess)
 			return true
 		}
-		// Prepend synthetic "." and ".." entries — Windows/macOS clients expect them.
-		dirInfo, _ := os.Lstat(open.Path)
-		parentInfo := dirInfo
-		if pi, err := os.Lstat(filepath.Dir(open.Path)); err == nil {
-			parentInfo = pi
-		}
+		// Prepend synthetic "." and ".." entries — Windows/macOS clients expect
+		// them. Both stats can fail even though the ReadDir above succeeded
+		// (the directory may be renamed or removed in between), and a nil
+		// os.FileInfo baked into a syntheticDirEntry is later dereferenced
+		// during record encoding, panicking the server. Omit an entry we
+		// cannot stat rather than carrying a nil through.
 		all := make([]os.DirEntry, 0, len(entries)+2)
-		all = append(all,
-			syntheticDirEntry{name: ".", info: dirInfo},
-			syntheticDirEntry{name: "..", info: parentInfo},
-		)
+		dirInfo, dirErr := os.Lstat(open.Path)
+		if dirErr == nil {
+			all = append(all, syntheticDirEntry{name: ".", info: dirInfo})
+		} else {
+			d.Log.Warn("query-dir: cannot stat directory, omitting \".\"", "path", open.Path, "err", dirErr)
+		}
+		parentInfo, parentErr := os.Lstat(filepath.Dir(open.Path))
+		if parentErr != nil {
+			// Fall back to the directory's own info — but only when that stat
+			// actually succeeded, otherwise ".." is omitted too.
+			parentInfo, parentErr = dirInfo, dirErr
+		}
+		if parentErr == nil {
+			all = append(all, syntheticDirEntry{name: "..", info: parentInfo})
+		} else {
+			d.Log.Warn("query-dir: cannot stat parent, omitting \"..\"", "path", open.Path, "err", parentErr)
+		}
 		all = append(all, entries...)
 
 		// Apply pattern filter (SMB-style glob, case-insensitive). Hide
@@ -1559,17 +1741,37 @@ func (d *Dispatcher) handleQueryDirectory(rw io.ReadWriter, hdr smb2.Header, bod
 	}
 	// AAPL READ_DIR_ATTR overlay applies only on disk shares (not IPC$) and
 	// only for the level-37 record class.
-	useAAPL := d.Conn.AAPLReadDirAttr &&
+	useAAPL := d.Conn != nil && d.Conn.AAPLReadDirAttr &&
 		open.Tree != nil && open.Tree.Share.Path != "" &&
 		req.FileInformationClass == smb2.InfoFileIdBothDirectoryInformation
-	buf, sent, err := encodeDirEntriesLimited(open, int(req.OutputBufferLength), req.FileInformationClass, limit, useAAPL)
+	buf, consumed, encoded, err := encodeDirEntriesLimited(open, int(req.OutputBufferLength), req.FileInformationClass, limit, useAAPL)
 	if err != nil {
+		if errors.Is(err, errUnsupportedDirInfoClass) {
+			d.respondError(rw, hdr, smb2.StatusInvalidInfoClass, sess)
+			return true
+		}
 		d.respondError(rw, hdr, smb2.StatusInternalError, sess)
 		return true
 	}
-	open.dirSent += sent
-	if sent == 0 {
-		d.respondError(rw, hdr, smb2.StatusNoMoreFiles, sess)
+	// Advance the enumeration cursor by the entries actually *consumed*, not
+	// by the records encoded. An entry skipped during encoding (it vanished
+	// between the scan and the encode) otherwise leaves dirSent pointing at an
+	// entry we already walked past, so the next QUERY_DIRECTORY re-emits files
+	// the client has already seen. rclone re-lists directories constantly, so
+	// a drifting cursor is immediately visible as duplicated entries.
+	open.dirSent += consumed
+	if encoded == 0 {
+		if open.dirSent >= len(open.dirEntries) {
+			d.respondError(rw, hdr, smb2.StatusNoMoreFiles, sess)
+			return true
+		}
+		// Entries remain but not even one fits in OutputBufferLength.
+		// Answering NO_MORE_FILES here silently truncates the listing;
+		// MS-SMB2 §3.3.5.18 requires STATUS_INFO_LENGTH_MISMATCH so the
+		// client retries with a buffer big enough for one record.
+		d.Log.Warn("query-dir: output buffer too small for one entry",
+			"path", open.Path, "buf_len", req.OutputBufferLength)
+		d.respondError(rw, hdr, smb2.StatusInfoLengthMismatch, sess)
 		return true
 	}
 	d.respondSuccess(rw, hdr, sess, smb2.EncodeQueryDirectoryResponse(smb2.QueryDirectoryResponse{Buffer: buf}))
@@ -1586,46 +1788,95 @@ func matchSMBPattern(pattern, name string) bool {
 	return ok
 }
 
-// encodeDirEntriesLimited packs at most `limit` entries (or as many as fit in
+// errUnsupportedDirInfoClass is returned when encodeDirRecord has no encoder
+// for the requested class. handleQueryDirectory turns it into
+// STATUS_INVALID_INFO_CLASS — the request is pre-validated by
+// supportedDirInfoClass, so this is a belt-and-braces guard that keeps a
+// newly-listed class from silently emitting a wrong-shaped record.
+var errUnsupportedDirInfoClass = errors.New("query-dir: unsupported information class")
+
+// supportedDirInfoClass reports whether encodeDirRecord can emit the requested
+// FileInformationClass. It must stay in lockstep with encodeDirRecord's switch.
+func supportedDirInfoClass(c uint8) bool {
+	switch c {
+	case smb2.InfoFileDirectoryInformation,
+		smb2.InfoFileFullDirectoryInformation,
+		smb2.InfoFileBothDirectoryInformation,
+		smb2.InfoFileNamesInformation,
+		smb2.InfoFileIdBothDirectoryInformation,
+		smb2.InfoFileIdFullDirectoryInformation:
+		return true
+	}
+	return false
+}
+
+// encodeDirEntriesLimited packs at most `limit` records (or as many as fit in
 // maxBytes) starting at open.dirSent. When useAAPL is true and infoClass is
 // FileIdBothDirectoryInformation, each record carries the Apple overlay so
 // Finder gets FinderInfo/rfork/mode in one round-trip.
-func encodeDirEntriesLimited(open *Open, maxBytes int, infoClass uint8, limit int, useAAPL bool) ([]byte, int, error) {
-	out := make([]byte, 0, maxBytes)
-	consumed := 0
+//
+// It returns the packed buffer, the number of entries consumed from
+// open.dirEntries (what the caller must add to open.dirSent), and the number
+// of records actually encoded. The two counts differ whenever an entry is
+// dropped mid-batch because its Info() failed — it was unlinked between
+// os.ReadDir and here. The cursor has to follow `consumed`: advancing by the
+// record count would leave it behind the scan position, so the next call
+// re-encodes entries the client already received.
+func encodeDirEntriesLimited(open *Open, maxBytes int, infoClass uint8, limit int, useAAPL bool) (out []byte, consumed, encoded int, err error) {
+	// maxBytes is client-chosen (bounded by MaxTransactSize upstream) and most
+	// listings are far smaller, so cap the up-front reservation and let append
+	// grow rather than allocating megabytes on every request.
+	initial := maxBytes
+	if initial > 64<<10 {
+		initial = 64 << 10
+	}
+	if initial < 0 {
+		initial = 0
+	}
+	out = make([]byte, 0, initial)
 	maxAccess := uint32(0x001F01FF)
 	if open.Tree != nil && open.Tree.Share.ReadOnly {
 		maxAccess = 0x001200A9
 	}
-	for i := open.dirSent; i < len(open.dirEntries) && consumed < limit; i++ {
+	for i := open.dirSent; i < len(open.dirEntries) && encoded < limit; i++ {
 		ent := open.dirEntries[i]
-		info, err := ent.Info()
-		if err != nil {
+		info, ierr := ent.Info()
+		if ierr != nil || info == nil {
+			// The entry vanished between the scan and now (or is an
+			// unstattable synthetic "."/".."). Skip the record but still count
+			// the entry as consumed so the cursor keeps pace with i.
+			consumed = i + 1 - open.dirSent
 			continue
 		}
 		var rforkSize uint64
 		if useAAPL && !info.IsDir() {
 			// Report the AAPL resource-fork size from its backing ADS xattr.
-			if data, err := readStreamXattr(filepath.Join(open.Path, ent.Name()), rforkStreamName); err == nil {
+			if data, xerr := readStreamXattr(filepath.Join(open.Path, ent.Name()), rforkStreamName); xerr == nil {
 				rforkSize = uint64(len(data))
 			}
 		}
 		rec := encodeDirRecord(ent.Name(), info, infoClass, useAAPL, maxAccess, rforkSize)
+		if rec == nil {
+			return nil, 0, 0, errUnsupportedDirInfoClass
+		}
 		padded := rec
 		if len(rec)%8 != 0 {
 			padded = append(append([]byte{}, rec...), make([]byte, 8-len(rec)%8)...)
 		}
 		if len(out)+len(padded) > maxBytes {
+			// Doesn't fit — leave `consumed` where it is so this entry is
+			// re-offered on the next call.
 			break
 		}
-		if consumed > 0 {
+		if encoded > 0 {
 			prevStart := lastRecordStart(out)
 			binary.LittleEndian.PutUint32(out[prevStart:], uint32(len(out)-prevStart))
 		}
 		out = append(out, padded...)
-		consumed++
+		encoded++
+		consumed = i + 1 - open.dirSent
 	}
-	return out, consumed, nil
+	return out, consumed, encoded, nil
 }
 
 func lastRecordStart(buf []byte) int {
@@ -1641,9 +1892,16 @@ func lastRecordStart(buf []byte) int {
 }
 
 // encodeDirRecord builds a single directory entry record. Supported classes:
-// FileDirectoryInformation, FileBothDirectoryInformation,
-// FileIdBothDirectoryInformation, FileFullDirectoryInformation,
-// FileNamesInformation. Other classes fall back to FileBothDirectoryInformation.
+// FileDirectoryInformation, FileFullDirectoryInformation,
+// FileBothDirectoryInformation, FileNamesInformation,
+// FileIdBothDirectoryInformation and FileIdFullDirectoryInformation.
+//
+// It returns nil for any other class. It must NOT fall back to a different
+// class: every class has its own fixed-part size, so emitting (say) a
+// 94-byte FILE_BOTH_DIR_INFORMATION record for a client that asked for the
+// 80-byte FILE_ID_FULL_DIR_INFORMATION makes the client parse garbage —
+// mis-sized names, bogus sizes, and a corrupt listing. Callers turn nil into
+// STATUS_INVALID_INFO_CLASS.
 //
 // When useAAPL is true and infoClass is FileIdBothDirectoryInformation, the
 // record overlays Apple's AAPL fields onto the record per Apple's spec
@@ -1765,9 +2023,50 @@ func encodeDirRecord(name string, info os.FileInfo, infoClass uint8, useAAPL boo
 		}
 		copy(out[fixed:], nameU16)
 		return out
-	default:
-		// FileBothDirectoryInformation: like above but no FileId field.
-		// Layout (94 bytes fixed + name).
+	case smb2.InfoFileIdFullDirectoryInformation:
+		// MS-FSCC §2.4.20 FILE_ID_FULL_DIR_INFORMATION — 80 fixed bytes + name:
+		// 0  NextEntryOffset (4)
+		// 4  FileIndex (4)
+		// 8  CreationTime (8)
+		// 16 LastAccessTime (8)
+		// 24 LastWriteTime (8)
+		// 32 ChangeTime (8)
+		// 40 EndOfFile (8)
+		// 48 AllocationSize (8)
+		// 56 FileAttributes (4)
+		// 60 FileNameLength (4)
+		// 64 EaSize (4)
+		// 68 Reserved (4)
+		// 72 FileId (8)
+		// 80 FileName (variable)
+		const fixed = 80
+		out := make([]byte, fixed+len(nameU16))
+		binary.LittleEndian.PutUint64(out[8:], filetimeFromTime(info.ModTime()))
+		binary.LittleEndian.PutUint64(out[16:], filetimeFromTime(info.ModTime()))
+		binary.LittleEndian.PutUint64(out[24:], filetimeFromTime(info.ModTime()))
+		binary.LittleEndian.PutUint64(out[32:], filetimeFromTime(info.ModTime()))
+		size := uint64(info.Size())
+		if info.IsDir() {
+			size = 0
+		}
+		binary.LittleEndian.PutUint64(out[40:], size)
+		binary.LittleEndian.PutUint64(out[48:], size)
+		attrs := uint32(smb2.FileAttrNormal)
+		if info.IsDir() {
+			attrs = smb2.FileAttrDirectory
+		}
+		binary.LittleEndian.PutUint32(out[56:], attrs)
+		binary.LittleEndian.PutUint32(out[60:], uint32(len(nameU16)))
+		// EaSize (64) and Reserved (68) stay zero. FileId carries the inode so
+		// clients have a stable identifier, matching what the IdBoth class does.
+		if _, inode := unixModeAndInode(info); inode != 0 {
+			binary.LittleEndian.PutUint64(out[72:], inode)
+		}
+		copy(out[fixed:], nameU16)
+		return out
+	case smb2.InfoFileBothDirectoryInformation:
+		// MS-FSCC §2.4.8 FILE_BOTH_DIR_INFORMATION: like IdBoth but with no
+		// FileId field. Layout (94 bytes fixed + name).
 		const fixed = 94
 		out := make([]byte, fixed+len(nameU16))
 		binary.LittleEndian.PutUint64(out[8:], filetimeFromTime(info.ModTime()))
@@ -1788,6 +2087,8 @@ func encodeDirRecord(name string, info os.FileInfo, infoClass uint8, useAAPL boo
 		binary.LittleEndian.PutUint32(out[60:], uint32(len(nameU16)))
 		copy(out[fixed:], nameU16)
 		return out
+	default:
+		return nil
 	}
 }
 

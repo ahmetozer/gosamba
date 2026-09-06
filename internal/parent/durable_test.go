@@ -266,8 +266,12 @@ func TestHandleCreate_DurableGrantAndReconnect(t *testing.T) {
 
 	// --- 2: simulate connection drop. The Open stays in the session in this
 	// white-box harness, but the durable entry must survive for reclaim. Drop
-	// it from the session to emulate a fresh connection. ---
+	// it from the session to emulate a fresh connection, and Detach the entry
+	// exactly as ServeConn's teardown does — a reconnect is only valid against
+	// a disconnected open, so without the Detach the reclaim is (correctly)
+	// refused as a takeover attempt. ---
 	sess.RemoveOpen(firstFileID)
+	tbl.Detach(d.Conn.ClientGuid, createGuid)
 	sess2 := &Session{}
 	sess2.AddTree(d.Shares[0])
 
@@ -454,7 +458,7 @@ func TestDurableTable_LazyReclaimClosesFd(t *testing.T) {
 	}
 }
 
-// TestDurableTable_ShareBinding verifies that ReclaimForShare rejects a
+// TestDurableTable_ShareBinding verifies that a reconnect rejects a
 // reconnect arriving on the wrong share (entry is NOT consumed) and succeeds on
 // the correct share.
 func TestDurableTable_ShareBinding(t *testing.T) {
@@ -466,23 +470,25 @@ func TestDurableTable_ShareBinding(t *testing.T) {
 	tbl.Register(cg, crg, open, time.Minute, "shareA", "alice")
 
 	// Wrong share: must fail without consuming the entry.
-	if _, ok := tbl.ReclaimForShare(cg, crg, "shareB", "alice"); ok {
-		t.Fatalf("ReclaimForShare with wrong share returned ok=true, want false")
+	if _, ok := tbl.reclaimForReconnect(cg, crg, "shareB", "alice"); ok {
+		t.Fatalf("reconnect with wrong share returned ok=true, want false")
 	}
 	if tbl.len() != 1 {
 		t.Fatalf("entry consumed by wrong-share reclaim, len=%d want 1", tbl.len())
 	}
 
-	// Correct share: must succeed and consume the entry.
-	got, ok := tbl.ReclaimForShare(cg, crg, "shareA", "alice")
+	// Correct share: must succeed and consume the entry. Detach first — a
+	// reconnect is only valid against an open whose connection has gone.
+	tbl.Detach(cg, crg)
+	got, ok := tbl.reclaimForReconnect(cg, crg, "shareA", "alice")
 	if !ok {
-		t.Fatalf("ReclaimForShare with correct share returned ok=false, want true")
+		t.Fatalf("reconnect with correct share returned ok=false, want true")
 	}
 	if got != open {
-		t.Fatalf("ReclaimForShare returned wrong open")
+		t.Fatalf("reconnect returned wrong open")
 	}
 	if tbl.len() != 0 {
-		t.Fatalf("entry not consumed after successful ReclaimForShare, len=%d want 0", tbl.len())
+		t.Fatalf("entry not consumed after successful reconnect, len=%d want 0", tbl.len())
 	}
 }
 
@@ -533,8 +539,11 @@ func TestHandleCreate_DurableReconnectWrongShareFails(t *testing.T) {
 	}
 	firstFileID := resp.FileID
 
-	// Simulate drop: remove open from session.
+	// Simulate drop: remove the open from the session and detach the durable
+	// entry, mirroring ServeConn's teardown. Until it is detached the entry is
+	// still owned by a live connection and no reconnect may reclaim it.
 	sessA.RemoveOpen(firstFileID)
+	tbl.Detach(conn.ClientGuid, createGuid)
 
 	// --- 2: reconnect on shareB --- must fail, entry untouched ---
 	sessB := &Session{}

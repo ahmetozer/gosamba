@@ -25,7 +25,7 @@ func TestStream_AFPInfoSynthesizedWhenEmpty(t *testing.T) {
 	d, sess, tree := newTestDispatcher(t, shareDir)
 	rw := discardRW{}
 
-	d.handleCreateNamedStream(rw, smb2.Header{Command: smb2.CommandCreate}, sess, tree, smb2.CreateRequest{}, "doc.txt", "AFP_AfpInfo")
+	d.handleCreateNamedStream(rw, smb2.Header{Command: smb2.CommandCreate}, sess, tree, smb2.CreateRequest{CreateDisposition: smb2.CreateDispositionOpenIf}, "doc.txt", "AFP_AfpInfo")
 	open := sess.GetOpen(d.LastCreatedFileID)
 	if open == nil {
 		t.Fatal("AFP_AfpInfo open not registered")
@@ -62,7 +62,7 @@ func TestStream_AFPInfoPersistsWhenWritten(t *testing.T) {
 	d, sess, tree := newTestDispatcher(t, shareDir)
 	rw := discardRW{}
 
-	d.handleCreateNamedStream(rw, smb2.Header{Command: smb2.CommandCreate}, sess, tree, smb2.CreateRequest{}, "doc.txt", "AFP_AfpInfo")
+	d.handleCreateNamedStream(rw, smb2.Header{Command: smb2.CommandCreate}, sess, tree, smb2.CreateRequest{CreateDisposition: smb2.CreateDispositionOpenIf}, "doc.txt", "AFP_AfpInfo")
 	open := sess.GetOpen(d.LastCreatedFileID)
 
 	// Client writes a full 60-byte AFPInfo with real FinderInfo bytes.

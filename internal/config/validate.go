@@ -62,15 +62,30 @@ func Validate(cfg *Config) error {
 		return fmt.Errorf("log.format %q: must be text|json", cfg.Log.Format)
 	}
 
+	// NetBIOS is parsed and merged but nothing ever binds :139 — there is no
+	// NBSS listener in the server. Silently accepting the flag would let an
+	// operator believe legacy clients can reach the server when they cannot,
+	// so refuse to start rather than lie. SMB2/3 needs only :445.
+	if cfg.Server.Netbios {
+		return fmt.Errorf("netbios: not implemented — nothing binds :139; remove --netbios / netbios = true (SMB2/3 uses :445 only)")
+	}
+
+	// Share names are matched case-insensitively at TREE_CONNECT
+	// (strings.EqualFold in parent/dispatch.go), so "Work" and "work" are the
+	// same share to a client but two entries here: the first would always win
+	// and the second would be permanently unreachable. Compare the same way
+	// the lookup does so the ambiguity is rejected instead of silently
+	// resolved.
 	seenShares := make(map[string]struct{})
 	for i, s := range cfg.Shares {
 		if s.Name == "" {
 			return fmt.Errorf("share[%d]: name is empty", i)
 		}
-		if _, dup := seenShares[s.Name]; dup {
-			return fmt.Errorf("share %q: duplicate name", s.Name)
+		key := strings.ToLower(s.Name)
+		if _, dup := seenShares[key]; dup {
+			return fmt.Errorf("share %q: duplicate name (share names are matched case-insensitively)", s.Name)
 		}
-		seenShares[s.Name] = struct{}{}
+		seenShares[key] = struct{}{}
 
 		st, err := os.Stat(s.Path)
 		if err != nil {
@@ -81,10 +96,39 @@ func Validate(cfg *Config) error {
 		}
 	}
 
+	// zeroHash is what a user is left with when no credential ever reached it:
+	// file.go skips the hex decode when nt_hash is missing or empty, leaving
+	// NTHash at its zero value. See the check below.
+	var zeroHash [16]byte
+
+	seenUsers := make(map[string]struct{})
 	for i, u := range cfg.Users {
 		if u.Name == "" {
 			return fmt.Errorf("user[%d]: name is empty", i)
 		}
+		// SESSION_SETUP resolves the account name with strings.EqualFold
+		// (parent/session.go) and takes the first match, so two users
+		// differing only in case collide: the second one's password and
+		// allow_shares would never take effect while the config still looks
+		// like it granted them. Reject the ambiguity.
+		nameKey := strings.ToLower(u.Name)
+		if _, dup := seenUsers[nameKey]; dup {
+			return fmt.Errorf("user %q: duplicate name (user names are matched case-insensitively)", u.Name)
+		}
+		seenUsers[nameKey] = struct{}{}
+
+		// An all-zero NT hash is not a credential — it is the absence of one.
+		// MD4 never produces 16 zero bytes for any password, so this value can
+		// only come from a missing, misspelled or empty nt_hash (or from an
+		// operator literally pasting zeros). Left unchecked it fails open
+		// silently: NTLMv2 verification would succeed for anyone who computes
+		// the response against 16 zero bytes, i.e. the account becomes
+		// world-authenticatable. Every account must carry a real hash, whether
+		// it came from nt_hash in the file or was derived from -u's password.
+		if u.NTHash == zeroHash {
+			return fmt.Errorf("user %q: no usable credential — set nt_hash (generate one with `gosamba hash`) or define the user with -u %s:<password>", u.Name, u.Name)
+		}
+
 		// No system_user: serve as the current process user, never privilege
 		// drop. Resolved without touching /etc/passwd.
 		if u.SystemUser == "" {

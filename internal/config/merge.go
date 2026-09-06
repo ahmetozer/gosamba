@@ -117,8 +117,23 @@ func Merge(cli CLI, file File) (Config, error) {
 
 	// --- users: file then CLI ---
 	for _, fu := range file.Users {
+		// allow_shares semantics, deliberately asymmetric:
+		//
+		//   key absent   (nil slice)   -> ["*"], every share. Kept for
+		//                                backward compatibility: configs
+		//                                written before allow_shares existed
+		//                                must keep working.
+		//   allow_shares = []          -> no shares at all. An operator who
+		//                                writes an empty list is revoking
+		//                                access, not asking for a wildcard;
+		//                                the old len()==0 test turned that
+		//                                into "every share" — a fail-open.
+		//
+		// The nil/empty distinction is the whole signal here: parseStringArray
+		// returns a non-nil empty slice for "[]" precisely so this branch can
+		// tell the two apart. Do not "simplify" either side to len(...) == 0.
 		shares := fu.AllowShares
-		if len(shares) == 0 {
+		if shares == nil {
 			shares = []string{"*"}
 		}
 		cfg.Users = append(cfg.Users, UserConfig{

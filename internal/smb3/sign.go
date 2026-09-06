@@ -41,12 +41,11 @@ func VerifyMessage(algo uint16, signingKey []byte, msg []byte) bool {
 	}
 	mac := computeMAC(algo, signingKey, msg)
 	copy(msg[48:64], saved[:])
-	for i := 0; i < 16; i++ {
-		if mac[i] != saved[i] {
-			return false
-		}
-	}
-	return true
+	// Constant-time compare. A byte-at-a-time loop that returns on the first
+	// mismatch leaks, through timing, how many leading bytes of a guessed
+	// signature were right, which turns forging a signature into 16 cheap
+	// byte-at-a-time searches instead of one 2^128 search.
+	return hmac.Equal(mac[:], saved[:])
 }
 
 func computeMAC(algo uint16, key, msg []byte) [16]byte {

@@ -47,6 +47,12 @@ func (m *lockManager) releaseAll(open *Open) {
 // conflictsWith reports whether an I/O by open over [offset,offset+length)
 // collides with a byte-range lock held by a different handle.
 func (m *lockManager) conflictsWith(open *Open, offset, length uint64, write bool) bool {
+	// This runs on every READ and WRITE, so the case where nobody holds a
+	// byte-range lock has to be nearly free: one atomic load, no fstat and no
+	// process-global mutex.
+	if length == 0 || m.tbl.empty() {
+		return false
+	}
 	key, err := m.keyFor(open)
 	if err != nil {
 		return false

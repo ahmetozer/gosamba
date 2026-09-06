@@ -22,12 +22,25 @@ type Selection struct {
 // dialects so that clients that don't speak 3.1.1 can still connect.
 var SupportedDialects = []Dialect{Dialect311, Dialect302, Dialect300, Dialect210, Dialect202}
 
-// SupportedCiphers, server preference order.
+// SupportedCiphers, server preference order. Preferring AES-256-GCM means the
+// session keys must be derived at 256 bits (MS-SMB2 §3.1.4.2 uses L=256 for the
+// AES-256 ciphers); see smb3.CipherKeyBits and its use in the session-setup
+// key derivation.
 var SupportedCiphers = []Cipher{CipherAES256GCM, CipherAES128GCM, CipherAES128CCM}
 
 // SupportedSigningAlgos, server preference order. CMAC first because GMAC nonce
 // construction (related-op bit, server-to-client bit per MS-SMB2 §3.1.4.1) has
 // quirks our impl hasn't fully validated against Windows/macOS yet.
+//
+// There is also a cryptographic reason to keep CMAC ahead of GMAC. The GMAC
+// nonce is fully determined by (MessageId, Flags & (SERVER_TO_REDIR|ASYNC)), so
+// an async command that emits an interim STATUS_PENDING and then a final
+// response — CHANGE_NOTIFY always does — signs two different messages under the
+// same key *and* the same GCM nonce. That is a forbidden-attack setup: the two
+// tags together disclose the GHASH subkey. The nonce derivation is what the
+// spec mandates (Windows and Samba build it identically), so it cannot be fixed
+// unilaterally without breaking signature verification on every real client;
+// choosing CMAC, which is nonce-free, avoids the situation instead.
 var SupportedSigningAlgos = []SigningAlgo{SigningAESCMAC, SigningAESGMAC}
 
 // Select chooses dialect/cipher/signing for this connection.

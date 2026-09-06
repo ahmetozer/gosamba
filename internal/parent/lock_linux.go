@@ -55,13 +55,24 @@ func flockRange(offset, length uint64) (start, l int64, ok bool) {
 
 func (m *lockManager) applyLock(open *Open, offset, length uint64, kind lockKind) error {
 	// A zero-length SMB2 range covers no bytes; passing it to fcntl would mean
-	// "lock to EOF" and grab the whole tail of the file.
+	// "lock to EOF" and grab the whole tail of the file. The shared table
+	// discards zero-length ranges too, so both platforms agree.
 	if length == 0 {
 		return nil
 	}
 	start, l, ok := flockRange(offset, length)
 	if !ok {
-		return errLockConflict
+		// Not expressible as an fcntl range. handleLock rejects these before
+		// they reach either platform; reporting a range error rather than a
+		// conflict keeps the status honest if one ever gets here.
+		return errLockRange
+	}
+	key, keyErr := m.keyFor(open)
+	// Refuse a lock the table cannot record *before* the kernel grants it: an
+	// untracked lock is invisible to the READ/WRITE conflict checks, and the
+	// table is what bounds how much lock state one client can pin.
+	if keyErr == nil && kind != lockUnlock && m.tbl.atCapacity(key, open) {
+		return errLockLimit
 	}
 	var t int16
 	switch kind {
@@ -81,7 +92,7 @@ func (m *lockManager) applyLock(open *Open, offset, length uint64, kind lockKind
 	}
 	// Mirror the kernel's decision into the in-process table so I/O checks see
 	// it. The kernel stays authoritative for granting; this is a shadow copy.
-	if key, err := m.keyFor(open); err == nil {
+	if keyErr == nil {
 		_ = m.tbl.apply(key, open, offset, length, kind)
 	}
 	return nil
@@ -100,6 +111,12 @@ func (m *lockManager) releaseAll(open *Open) {
 // conflictsWith reports whether an I/O by open over [offset,offset+length)
 // collides with a byte-range lock held by a different handle.
 func (m *lockManager) conflictsWith(open *Open, offset, length uint64, write bool) bool {
+	// This runs on every READ and WRITE, so the case where nobody holds a
+	// byte-range lock has to be nearly free: one atomic load, no fstat and no
+	// process-global mutex.
+	if length == 0 || m.tbl.empty() {
+		return false
+	}
 	key, err := m.keyFor(open)
 	if err != nil {
 		return false

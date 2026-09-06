@@ -79,9 +79,23 @@ func ServeConn(ctx context.Context, c net.Conn, log *slog.Logger, maxFrame uint3
 	log = log.With("remote", c.RemoteAddr().String())
 	log.Info("connection opened")
 
+	// Force the socket shut when the server context is cancelled, so a read
+	// blocked on an idle peer unblocks and this connection tears down.
+	//
+	// The watcher must also exit when THIS connection ends. Selecting on
+	// ctx.Done() alone parks the goroutine until server shutdown, so a server
+	// that has handled many short-lived connections accumulates one parked
+	// goroutine (and its captured net.Conn) per connection for the life of the
+	// process — an unauthenticated peer could grow that without bound just by
+	// connecting and disconnecting.
+	connDone := make(chan struct{})
+	defer close(connDone)
 	go func() {
-		<-ctx.Done()
-		_ = c.Close()
+		select {
+		case <-ctx.Done():
+			_ = c.Close()
+		case <-connDone:
+		}
 	}()
 
 	// Wrap the connection in a bufio.Reader so we coalesce the small

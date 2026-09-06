@@ -187,6 +187,21 @@ func (e *durableEntry) expired(now time.Time) bool {
 	return !e.attached() && now.After(e.deadline)
 }
 
+// releaseOpen gives up an abandoned durable open: it releases the byte-range
+// locks the open still holds and closes its descriptor. Nothing else can reach
+// the open once it has left the table, so skipping either step leaks a kernel
+// fd and (on darwin) an entry in the process-global lock table forever.
+//
+// The order matters: releaseAll's key lookup does an Fstat on the fd, which
+// fails — and then silently no-ops — once the file is closed.
+func releaseOpen(o *Open) {
+	if o == nil || o.File == nil {
+		return
+	}
+	sharedLockManager.releaseAll(o)
+	o.File.Close()
+}
+
 // DurableTable holds durable opens keyed by (ClientGuid, CreateGuid). It is
 // server-scoped (created once and shared across every ServeConn) so an entry
 // survives the drop of the TCP connection that created it: a client that
@@ -206,16 +221,48 @@ func NewDurableTable() *DurableTable {
 // connection drops. The shareName and userName are stored and checked on
 // reclaim (MS-SMB2 §3.3.5.9.7). A zero or negative timeout removes any existing
 // entry (treated as non-durable).
-func (t *DurableTable) Register(clientGuid, createGuid [16]byte, open *Open, timeout time.Duration, shareName, userName string) {
+//
+// Register reports whether the open is now durable. It returns false — leaving
+// the table untouched — when the key is already held by an entry that is still
+// ATTACHED to a live connection, i.e. the client reused a CreateGuid that is
+// currently in use. Overwriting that entry would orphan the previous open: the
+// map slot is the only reference to it, so its descriptor could never be closed
+// and its byte-range locks would stay held for the life of the process. The
+// CREATE that triggered this still succeeds; it just does not get a durable
+// grant, and a caller that sees false must not mark the open durable.
+//
+// A DETACHED entry under the same key belongs to a connection that is already
+// gone, so a fresh registration legitimately supersedes it: its locks are
+// released and its fd closed before the new entry takes the slot.
+func (t *DurableTable) Register(clientGuid, createGuid [16]byte, open *Open, timeout time.Duration, shareName, userName string) bool {
 	if t == nil {
-		return
+		return false
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	k := durableKey{clientGuid: clientGuid, createGuid: createGuid}
+	prev, exists := t.entries[k]
+	// Re-registering the very same Open (e.g. refreshing the timeout) must not
+	// touch its descriptor — it is the live handle we are about to record.
+	superseded := exists && prev.open != open
+
 	if timeout <= 0 {
+		// Non-durable: drop any existing entry. A detached entry has no live
+		// connection left to close its fd on teardown, so release it here; an
+		// attached one is still owned by its connection, which closes it.
+		if superseded && !prev.attached() {
+			releaseOpen(prev.open)
+		}
 		delete(t.entries, k)
-		return
+		return false
+	}
+	if superseded {
+		if prev.attached() {
+			// A live connection is still using this handle. Refuse rather than
+			// silently clobbering (and thereby orphaning) it.
+			return false
+		}
+		releaseOpen(prev.open)
 	}
 	t.entries[k] = &durableEntry{
 		open:      open,
@@ -223,6 +270,7 @@ func (t *DurableTable) Register(clientGuid, createGuid [16]byte, open *Open, tim
 		shareName: shareName,
 		userName:  userName,
 	}
+	return true
 }
 
 // Detach marks an entry as no longer owned by a live connection and starts its
@@ -263,21 +311,26 @@ func (t *DurableTable) Reclaim(clientGuid, createGuid [16]byte) (*Open, bool) {
 		// locks, which the kernel releases automatically on close anyway) —
 		// release the in-process ranges before closing so the global lock
 		// table doesn't leak entries for a file we'll never touch again.
-		if e.open != nil && e.open.File != nil {
-			sharedLockManager.releaseAll(e.open)
-			e.open.File.Close()
-		}
+		releaseOpen(e.open)
 		return nil, false
 	}
 	return e.open, true
 }
 
-// ReclaimForShare is like Reclaim but additionally enforces that the reconnect
-// arrives on the same share as the original CREATE (MS-SMB2 §3.3.5.9.7). If
-// the share name does not match, it returns ok=false without consuming the
-// entry (leaving it available for a correctly-targeted reconnect attempt or
-// expiry sweep).
-func (t *DurableTable) ReclaimForShare(clientGuid, createGuid [16]byte, shareName, userName string) (*Open, bool) {
+// reclaimForReconnect is the DH2C/DHnC reconnect path. On top of the share and
+// user checks it refuses any entry that is still ATTACHED: per MS-SMB2
+// §3.3.5.9.7 a durable reconnect is only valid against an open whose Connection
+// is gone. Without this a second connection presenting the same (ClientGuid,
+// CreateGuid) could steal a live handle — and the fd — out from under the
+// connection that is still using it.
+func (t *DurableTable) reclaimForReconnect(clientGuid, createGuid [16]byte, shareName, userName string) (*Open, bool) {
+	return t.reclaimChecked(clientGuid, createGuid, shareName, userName, true)
+}
+
+// reclaimChecked is the shared core of the reclaim paths. A failed
+// check never consumes the entry, so a rejected attempt cannot be used to evict
+// another connection's handle.
+func (t *DurableTable) reclaimChecked(clientGuid, createGuid [16]byte, shareName, userName string, requireDetached bool) (*Open, bool) {
 	if t == nil {
 		return nil, false
 	}
@@ -291,11 +344,13 @@ func (t *DurableTable) ReclaimForShare(clientGuid, createGuid [16]byte, shareNam
 	if e.expired(time.Now()) {
 		// Lazy eviction: close the fd so we don't leak it. Release ranges
 		// first (see the equivalent comment in Reclaim above).
-		if e.open != nil && e.open.File != nil {
-			sharedLockManager.releaseAll(e.open)
-			e.open.File.Close()
-		}
+		releaseOpen(e.open)
 		delete(t.entries, k)
+		return nil, false
+	}
+	// Still owned by a live connection: this is not a reconnect, it is a
+	// takeover attempt. Reject without disturbing the entry.
+	if requireDetached && e.attached() {
 		return nil, false
 	}
 	// Share mismatch: reject without consuming the entry.
@@ -376,10 +431,7 @@ func (t *DurableTable) Expire(now time.Time) int {
 	for k, e := range t.entries {
 		if e.expired(now) {
 			// Release ranges first (see the equivalent comment in Reclaim).
-			if e.open != nil && e.open.File != nil {
-				sharedLockManager.releaseAll(e.open)
-				e.open.File.Close()
-			}
+			releaseOpen(e.open)
 			delete(t.entries, k)
 			n++
 		}
@@ -413,13 +465,13 @@ func (d *Dispatcher) handleDurableReconnect(rw io.ReadWriter, hdr smb2.Header, s
 	if d.Conn == nil || d.Conn.Durable == nil {
 		return false
 	}
-	saved, ok := d.Conn.Durable.ReclaimForShare(d.Conn.ClientGuid, durableLookupKey(rec), tree.Share.Name, sess.User.Name)
+	saved, ok := d.Conn.Durable.reclaimForReconnect(d.Conn.ClientGuid, durableLookupKey(rec), tree.Share.Name, sess.User.Name)
 	if !ok {
 		return false
 	}
-	// Enforce share binding (MS-SMB2 §3.3.5.9.7): if the reconnect arrives on
-	// a different share than the original CREATE, reject it. ReclaimForShare
-	// above already enforced this; saved is non-nil only when shares matched.
+	// reclaimForReconnect above already enforced all three MS-SMB2 §3.3.5.9.7
+	// preconditions — same share, same user, and the owning connection gone —
+	// so saved is non-nil only for a legitimate reconnect.
 
 	// The saved descriptor belonged to the dropped connection; close it so we
 	// don't leak the fd, then re-open fresh below. Release its byte-range
@@ -427,10 +479,7 @@ func (d *Dispatcher) handleDurableReconnect(rw io.ReadWriter, hdr smb2.Header, s
 	// linux OFD locks, which live in the kernel and are unaffected by which
 	// *os.File we're using); this is an accepted darwin limitation. Doing
 	// this also prevents the global lock table from leaking entries.
-	if saved.File != nil {
-		sharedLockManager.releaseAll(saved)
-		saved.File.Close()
-	}
+	releaseOpen(saved)
 
 	// Re-open the backing file with a fresh descriptor on the same path. The
 	// original *os.File belonged to the dropped connection; we cannot assume
@@ -464,8 +513,17 @@ func (d *Dispatcher) handleDurableReconnect(rw io.ReadWriter, hdr smb2.Header, s
 	}
 
 	sess.AddOpen(open)
-	// Re-register so a subsequent drop can reclaim again.
-	d.Conn.Durable.Register(open.DurableClientGuid, open.DurableCreateGuid, open, d.Conn.DurableTimeout, tree.Share.Name, sess.User.Name)
+	// Re-register so a subsequent drop can reclaim again. The reclaim above
+	// removed the entry, so the slot is normally free; it can only be taken
+	// again if a racing connection registered the same CreateGuid in between.
+	// In that case leave this open non-durable — clobbering the racer's live
+	// entry is exactly the orphaning Register refuses to do — so that teardown
+	// closes our fd instead of leaving it for a reclaim that can never happen.
+	if !d.Conn.Durable.Register(open.DurableClientGuid, open.DurableCreateGuid, open, d.Conn.DurableTimeout, tree.Share.Name, sess.User.Name) {
+		open.IsDurable = false
+		d.Log.Warn("durable handle re-registration refused after reconnect; handle is not reclaimable",
+			"path", open.Path, "share", tree.Share.Name)
+	}
 	d.LastCreatedFileID = open.FileID
 	d.HasLastCreated = true
 
@@ -535,27 +593,38 @@ func (d *Dispatcher) applyDurableAndLease(open *Open, dq durableRequest, lr leas
 				timeout = req
 			}
 		}
-		open.IsDurable = true
-		open.DurableClientGuid = d.Conn.ClientGuid
-		if dq.v2 {
-			open.DurableCreateGuid = dq.guid
-		} else {
+		clientGuid := d.Conn.ClientGuid
+		createGuid := dq.guid
+		if !dq.v2 {
 			// v1 has no CreateGuid; key the entry by the FileID instead.
-			open.DurableCreateGuid = open.FileID
+			createGuid = open.FileID
 		}
 		shareName := ""
 		if open.Tree != nil {
 			shareName = open.Tree.Share.Name
 		}
-		d.Conn.Durable.Register(open.DurableClientGuid, open.DurableCreateGuid, open, timeout, shareName, userName)
+		// Only mark the open durable — and only advertise the grant — if the
+		// table actually took it. Register refuses a CreateGuid that another
+		// LIVE connection is already using, because taking that slot would
+		// orphan the other connection's descriptor.
+		if d.Conn.Durable.Register(clientGuid, createGuid, open, timeout, shareName, userName) {
+			open.IsDurable = true
+			open.DurableClientGuid = clientGuid
+			open.DurableCreateGuid = createGuid
 
-		if dq.v2 {
-			ctxs = append(ctxs, smb2.CreateContext{
-				Name: tagDH2Q,
-				Data: encodeDH2QResponse(uint32(timeout/time.Millisecond), 0),
-			})
+			if dq.v2 {
+				ctxs = append(ctxs, smb2.CreateContext{
+					Name: tagDH2Q,
+					Data: encodeDH2QResponse(uint32(timeout/time.Millisecond), 0),
+				})
+			} else {
+				ctxs = append(ctxs, smb2.CreateContext{Name: tagDHnQ, Data: encodeDHnQResponse()})
+			}
 		} else {
-			ctxs = append(ctxs, smb2.CreateContext{Name: tagDHnQ, Data: encodeDHnQResponse()})
+			// The CREATE still succeeds, just without durability; the client
+			// re-opens by path after a disconnect instead of reclaiming.
+			d.Log.Warn("durable handle request refused: CreateGuid is in use by a live open",
+				"path", open.Path, "share", shareName, "user", userName)
 		}
 	}
 

@@ -12,10 +12,13 @@ requires that the built-in SMB service (File Sharing / `smbd`) isn't already
 holding the port — disable macOS File Sharing or run `gosamba` on an
 alternate port with `-l`.
 
-On macOS, the change-notify watcher opens one file descriptor per watched
-file/directory, so watching very large trees can hit the default 256
-open-file limit — raise it with `ulimit -n` if you see notify setup
-failures on a big share.
+On macOS the change-notify watcher needs one file descriptor per watched
+directory (and per file it watches for in-place edits), so the number of
+watches is capped process-wide — roughly an eighth of `RLIMIT_NOFILE`,
+clamped to 32–512. Past that cap, creates, deletes and renames are still
+reported; only in-place modifications of the extra files are missed, and a
+client recovers by re-enumerating the directory. Raise `ulimit -n` if you
+watch very large trees and want the cap to scale with it.
 
 ## Features
 
@@ -25,7 +28,9 @@ failures on a big share.
   default (configurable to preferred/off).
 - **Durable handles** — opens survive a dropped TCP connection and can be
   reclaimed after reconnect.
-- **Locking, oplocks/leases, and change-notify** for correct multi-client access.
+- **Byte-range locking and change-notify** for correct multi-client access.
+  (Leases are negotiated but granted as `LEASE_NONE`: the server implements no
+  lease-break, so it never promises a client a cache it cannot revoke.)
 - **Apple client support** — AAPL create-context extensions and a synthesized
   `AFP_AfpInfo` stream so macOS Finder and the iOS Files app work smoothly.
 - **Extended attributes & alternate data streams.**
@@ -87,12 +92,12 @@ smbclient //your-host/public -U alice
 | `-u`, `--user <smb_user>:<password>[:<system_user>]` | Define a user (repeatable). See [user mapping](#user-mapping). |
 | `-c`, `--config <file>` | Load a TOML config file. |
 | `-l`, `--listen <addr>` | Listen address (default `:445`). |
-| `--netbios` | Also bind the legacy NetBIOS port `:139`. |
+| `--netbios` | **Not implemented** — rejected at startup. Nothing binds `:139`; SMB2/3 uses `:445` only. |
 | `--mdns` | Advertise via mDNS/Bonjour (default on). |
 | `--no-encryption` | Allow non-encrypted SMB3 sessions. |
 | `--no-signing` | Allow unsigned messages. |
 | `--durable-timeout <dur>` | Durable-handle timeout, e.g. `60s`. |
-| `--state-dir <path>` | Runtime state directory. |
+| `--state-dir <path>` | Reserved — parsed and stored, but nothing reads it yet. |
 | `--per-user-privdrop` | Drop to each authenticated user's uid/gid (requires root). |
 | `--log-level <level>` | `debug` \| `info` \| `warn` \| `error`. |
 | `--log-format <fmt>` | `text` \| `json`. |
@@ -185,12 +190,14 @@ The only external dependencies are the `golang.org/x` extensions
 ```sh
 make test         # go test ./...
 make test-race    # race detector
+make test-e2e     # smbclient-driven end-to-end tests (needs `make e2e-deps`)
 make vet          # go vet
 make fmt          # go fmt
 ```
 
-Some end-to-end tests drive a real `smbclient` against the server. Install it
-with:
+Some end-to-end tests drive a real `smbclient` against the server. They sit
+behind the `smbclient_e2e` build tag, so a plain `make test` skips them —
+use `make test-e2e` (CI runs it on Linux). Install `smbclient` with:
 
 ```sh
 make e2e-deps     # apt-get install smbclient

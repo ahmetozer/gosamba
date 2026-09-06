@@ -158,7 +158,7 @@ func TestHardening_StreamOffsetNoPanic(t *testing.T) {
 		t.Fatal(err)
 	}
 	rw := discardRW{}
-	d.handleCreateNamedStream(rw, smb2.Header{Command: smb2.CommandCreate}, sess, tree, smb2.CreateRequest{}, "doc.txt", "s")
+	d.handleCreateNamedStream(rw, smb2.Header{Command: smb2.CommandCreate}, sess, tree, smb2.CreateRequest{CreateDisposition: smb2.CreateDispositionOpenIf}, "doc.txt", "s")
 	open := sess.GetOpen(d.LastCreatedFileID)
 	if open == nil || !open.IsStream {
 		t.Fatalf("stream open not registered")
@@ -313,11 +313,14 @@ func TestHardening_DurableReclaimChecksUser(t *testing.T) {
 	crg[0] = 0x02
 	open := &Open{Path: "/owned"}
 	tbl.Register(cg, crg, open, time.Minute, "share", "alice")
+	// A reconnect is only valid once the owning connection has gone, so
+	// simulate the drop before attempting one.
+	tbl.Detach(cg, crg)
 
-	if _, ok := tbl.ReclaimForShare(cg, crg, "share", "mallory"); ok {
+	if _, ok := tbl.reclaimForReconnect(cg, crg, "share", "mallory"); ok {
 		t.Errorf("a different user reclaimed another user's durable handle")
 	}
-	if _, ok := tbl.ReclaimForShare(cg, crg, "share", "alice"); !ok {
+	if _, ok := tbl.reclaimForReconnect(cg, crg, "share", "alice"); !ok {
 		t.Errorf("the owning user could not reclaim their own handle")
 	}
 }
@@ -489,5 +492,56 @@ func TestHardening_NotifyCancelCompletesRequest(t *testing.T) {
 	}
 	if reg2.status != smb2.StatusNotifyCleanup {
 		t.Errorf("notify completed with 0x%08X, want NOTIFY_CLEANUP", reg2.status)
+	}
+}
+
+// TestHardening_StreamTruncatingDispositionClearsBuffer proves a truncating
+// disposition starts the stream empty. Before the fix the buffer was loaded
+// from the existing xattr and a shorter write only overwrote its prefix, so
+// CLOSE flushed the new content followed by a stale tail of the old.
+func TestHardening_StreamTruncatingDispositionClearsBuffer(t *testing.T) {
+	shareDir := t.TempDir()
+	base := filepath.Join(shareDir, "doc.txt")
+	if err := os.WriteFile(base, []byte("body"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	d, sess, tree := newTestDispatcher(t, shareDir)
+	rw := discardRW{}
+	hdr := smb2.Header{Command: smb2.CommandCreate}
+
+	// Seed a long stream via a non-truncating open.
+	openIf := smb2.CreateRequest{CreateDisposition: smb2.CreateDispositionOpenIf}
+	d.handleCreateNamedStream(rw, hdr, sess, tree, openIf, "doc.txt", "s")
+	o1 := sess.GetOpen(d.LastCreatedFileID)
+	if o1 == nil {
+		t.Fatal("stream open not registered")
+	}
+	long := []byte("AAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+	d.handleWrite(rw, smb2.Header{Command: smb2.CommandWrite}, buildWriteBody(o1.FileID, 0, long), sess)
+	d.handleClose(rw, smb2.Header{Command: smb2.CommandClose}, buildCloseBody(o1.FileID), sess)
+
+	// Reopen with OVERWRITE_IF: the buffer must start empty, not preloaded.
+	over := smb2.CreateRequest{CreateDisposition: smb2.CreateDispositionOverwriteIf}
+	d.handleCreateNamedStream(rw, hdr, sess, tree, over, "doc.txt", "s")
+	o2 := sess.GetOpen(d.LastCreatedFileID)
+	if o2 == nil {
+		t.Fatal("second stream open not registered")
+	}
+	if len(o2.streamBuf) != 0 {
+		t.Fatalf("truncating open preloaded %d bytes, want an empty buffer", len(o2.streamBuf))
+	}
+
+	// A short write must not leave the old tail behind.
+	short := []byte("bb")
+	d.handleWrite(rw, smb2.Header{Command: smb2.CommandWrite}, buildWriteBody(o2.FileID, 0, short), sess)
+	d.handleClose(rw, smb2.Header{Command: smb2.CommandClose}, buildCloseBody(o2.FileID), sess)
+
+	d.handleCreateNamedStream(rw, hdr, sess, tree, openIf, "doc.txt", "s")
+	o3 := sess.GetOpen(d.LastCreatedFileID)
+	if o3 == nil {
+		t.Fatal("third stream open not registered")
+	}
+	if string(o3.streamBuf) != string(short) {
+		t.Errorf("stream after truncating overwrite = %q, want %q (stale tail survived)", o3.streamBuf, short)
 	}
 }

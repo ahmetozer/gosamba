@@ -6,7 +6,50 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"syscall"
+	"time"
 )
+
+// Backoff bounds applied after a temporary Accept failure. The first retry is
+// almost immediate so an isolated ECONNABORTED costs nothing, and the doubling
+// cap keeps a sustained fd exhaustion from spinning the accept loop at 100% CPU
+// while still recovering within a second of descriptors freeing up.
+const (
+	acceptRetryDelayMin = 5 * time.Millisecond
+	acceptRetryDelayMax = 1 * time.Second
+)
+
+// isTemporaryAcceptError reports whether an Accept error is a transient,
+// per-connection condition that must NOT bring the server down.
+//
+// The critical cases are EMFILE/ENFILE: running out of file descriptors is a
+// load condition, and returning from Serve would turn "one client too many"
+// into "the whole SMB server is gone" — an unauthenticated denial of service.
+// ECONNABORTED (peer vanished between the SYN and our accept) and the memory
+// pressure errnos are equally survivable.
+//
+// net.Error.Temporary() would cover most of this but is deprecated and was
+// never well defined, so the errnos are matched explicitly. Timeout() is still
+// meaningful and is honoured for listeners with a deadline set.
+func isTemporaryAcceptError(err error) bool {
+	switch {
+	case errors.Is(err, syscall.EMFILE), // per-process fd limit
+		errors.Is(err, syscall.ENFILE),       // system-wide fd limit
+		errors.Is(err, syscall.ENOBUFS),      // out of socket buffers
+		errors.Is(err, syscall.ENOMEM),       // out of memory
+		errors.Is(err, syscall.ECONNABORTED), // peer gave up before accept
+		errors.Is(err, syscall.ECONNRESET),   // ditto, RST instead of FIN
+		errors.Is(err, syscall.EINTR),        // interrupted by a signal
+		errors.Is(err, syscall.EAGAIN),       // nothing pending after all
+		errors.Is(err, syscall.EPERM):        // firewall rejected this SYN
+		return true
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return true
+	}
+	return false
+}
 
 // ConnHandler handles a single accepted connection. It must close the
 // connection before returning.
@@ -41,6 +84,7 @@ func (s *Listener) Serve(ctx context.Context, ln net.Listener) error {
 	}()
 
 	var wg sync.WaitGroup
+	var retryDelay time.Duration
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -48,10 +92,32 @@ func (s *Listener) Serve(ctx context.Context, ln net.Listener) error {
 				wg.Wait()
 				return nil
 			}
+			if isTemporaryAcceptError(err) {
+				// Shed this one connection, not the server. Back off so a
+				// persistent condition (fd exhaustion) does not spin.
+				if retryDelay == 0 {
+					retryDelay = acceptRetryDelayMin
+				} else if retryDelay < acceptRetryDelayMax {
+					retryDelay *= 2
+					retryDelay = min(retryDelay, acceptRetryDelayMax)
+				}
+				s.Log.Warn("accept failed transiently; retrying", "err", err, "retry_in", retryDelay)
+				timer := time.NewTimer(retryDelay)
+				select {
+				case <-timer.C:
+				case <-ctx.Done():
+					timer.Stop()
+					wg.Wait()
+					return nil
+				}
+				continue
+			}
 			s.Log.Error("accept failed", "err", err)
 			wg.Wait()
 			return err
 		}
+		// A successful accept means the transient condition cleared.
+		retryDelay = 0
 		// SMB is roundtrip-bound; explicitly disable Nagle. Go enables this
 		// by default but proxies/tunnels can re-enable it.
 		if tc, ok := conn.(*net.TCPConn); ok {
@@ -62,7 +128,14 @@ func (s *Listener) Serve(ctx context.Context, ln net.Listener) error {
 			// Hand the connection off to a worker process that owns it entirely
 			// and drops privileges after auth. The parent does NOT serve it.
 			if err := reExecWorker(conn, s.Log); err != nil {
-				s.Log.Error("re-exec worker failed; dropping connection", "err", err)
+				if errors.Is(err, errWorkerLimit) {
+					// Load shedding, not a failure: an unauthenticated peer must
+					// not be able to fork the host to death by opening sockets.
+					s.Log.Warn("worker limit reached; refusing connection",
+						"limit", maxConcurrentWorkers, "remote", conn.RemoteAddr().String())
+				} else {
+					s.Log.Error("re-exec worker failed; dropping connection", "err", err)
+				}
 			}
 			_ = conn.Close() // parent always closes its copy of the fd
 			continue
