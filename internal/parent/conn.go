@@ -154,11 +154,12 @@ func ServeConn(ctx context.Context, c net.Conn, log *slog.Logger, maxFrame uint3
 		})
 	}()
 	ssHandler := &SessionSetupHandler{
-		Conn:     conn,
-		Sessions: sessions,
-		Users:    opts.Users,
-		Shares:   opts.Shares,
-		Log:      log,
+		Conn:              conn,
+		Sessions:          sessions,
+		Users:             opts.Users,
+		Shares:            opts.Shares,
+		Log:               log,
+		RequireEncryption: opts.RequireEncryption,
 	}
 	dispatcher = &Dispatcher{
 		Conn:              conn,

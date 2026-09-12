@@ -632,3 +632,83 @@ func TestFixCrypto_AuthenticationFreesHalfOpenSlot(t *testing.T) {
 		}
 	}
 }
+
+// readSessionFlags pulls SessionFlags out of the last SESSION_SETUP response
+// the handler wrote to the harness pipe.
+func readSessionFlags(t *testing.T, hs *fixCryptoHarness) uint16 {
+	t.Helper()
+	var flags uint16
+	var found bool
+	for {
+		frame, err := transport.ReadFrame(hs.out, transport.MaxFrameSize)
+		if err != nil {
+			break
+		}
+		hdr, err := smb2.DecodeHeader(frame[:smb2.HeaderSize])
+		if err != nil || hdr.Command != smb2.CommandSessionSetup {
+			continue
+		}
+		body := frame[smb2.HeaderSize:]
+		if len(body) < 4 {
+			continue
+		}
+		flags = binary.LittleEndian.Uint16(body[2:])
+		found = true
+	}
+	if !found {
+		t.Fatal("no SESSION_SETUP response frame found")
+	}
+	return flags
+}
+
+// TestFixCrypto_EncryptDataFlagAdvertised is the regression test for a server
+// that required encryption but never told the client to encrypt.
+//
+// The dispatcher refuses cleartext once a session is up, so without
+// SMB2_SESSION_FLAG_ENCRYPT_DATA in the SESSION_SETUP response the client keeps
+// sending in the clear and every request is denied — the session authenticates
+// and then dies on the first CREATE. Observed against the macOS client, which
+// negotiates AES-256-GCM:
+//
+//	"session authenticated" ... smb_user=ahmet
+//	"unencrypted request but encryption required — denying" cmd=CREATE
+func TestFixCrypto_EncryptDataFlagAdvertised(t *testing.T) {
+	for _, cipher := range []smb2.Cipher{smb2.CipherAES256GCM, smb2.CipherAES128GCM, smb2.CipherAES128CCM} {
+		hs := newFixCryptoHarness(t, cipher, fixCryptoUsers("test123"))
+		hs.h.RequireEncryption = true
+
+		leg := hs.leg1(t, 1)
+		auth := buildAuthenticate(t, leg, "alice", "WORKGROUP", "test123", true, nil)
+		hdr, body, frame := sessionSetupFrame(auth.secBuf, 2, leg.sessionID)
+		sess, err := hs.h.HandleSessionSetup(hs.pipe, hdr, body, frame)
+		if err != nil || sess == nil {
+			t.Fatalf("cipher 0x%04x: session setup failed: %v", cipher, err)
+		}
+
+		flags := readSessionFlags(t, hs)
+		if flags&smb2.SessionFlagEncryptData == 0 {
+			t.Errorf("cipher 0x%04x: SESSION_SETUP flags=0x%04x, missing ENCRYPT_DATA — the client is never told to encrypt", cipher, flags)
+		}
+		if flags&smb2.SessionFlagIsGuest != 0 {
+			t.Errorf("cipher 0x%04x: authenticated session wrongly marked guest", cipher)
+		}
+	}
+}
+
+// TestFixCrypto_NoEncryptDataWhenNotRequired keeps the flag off when the
+// operator did not ask for encryption, so --no-encryption deployments are not
+// forced into it.
+func TestFixCrypto_NoEncryptDataWhenNotRequired(t *testing.T) {
+	hs := newFixCryptoHarness(t, smb2.CipherAES256GCM, fixCryptoUsers("test123"))
+	hs.h.RequireEncryption = false
+
+	leg := hs.leg1(t, 1)
+	auth := buildAuthenticate(t, leg, "alice", "WORKGROUP", "test123", true, nil)
+	hdr, body, frame := sessionSetupFrame(auth.secBuf, 2, leg.sessionID)
+	if _, err := hs.h.HandleSessionSetup(hs.pipe, hdr, body, frame); err != nil {
+		t.Fatalf("session setup failed: %v", err)
+	}
+	if flags := readSessionFlags(t, hs); flags&smb2.SessionFlagEncryptData != 0 {
+		t.Errorf("ENCRYPT_DATA set (flags=0x%04x) although encryption is not required", flags)
+	}
+}
