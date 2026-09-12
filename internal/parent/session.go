@@ -358,6 +358,15 @@ type SessionSetupHandler struct {
 	Users    []config.UserConfig
 	Shares   []config.ShareConfig
 	Log      *slog.Logger
+
+	// RequireEncryption mirrors the server's encryption policy. It decides
+	// whether the SESSION_SETUP response carries SMB2_SESSION_FLAG_ENCRYPT_DATA,
+	// which is the ONLY way a client learns it must start encrypting. The
+	// dispatcher refuses cleartext once the session is up, so failing to send
+	// this flag does not merely weaken security — it breaks the session
+	// outright, because the client keeps sending in the clear and every
+	// request is denied.
+	RequireEncryption bool
 }
 
 // hasGuestShare reports whether any configured share allows anonymous access.
@@ -602,8 +611,15 @@ func (h *SessionSetupHandler) handleType3(rw io.ReadWriter, hdr smb2.Header, typ
 	sess.ntlmChallenge = nil
 
 	var sessFlags uint16
-	if isGuest {
-		sessFlags = 0x0001 // SMB2_SESSION_FLAG_IS_GUEST
+	switch {
+	case isGuest:
+		sessFlags = smb2.SessionFlagIsGuest
+	case h.RequireEncryption && h.Conn != nil && h.Conn.Selection.Cipher != 0:
+		// Tell the client to encrypt everything from here on (MS-SMB2
+		// §3.3.5.5.3). A guest session has no keys, and a session with no
+		// negotiated cipher cannot encrypt at all — asserting the flag in
+		// either case would ask for something the client cannot do.
+		sessFlags = smb2.SessionFlagEncryptData
 	}
 	spnego := smb2.WrapNTLMResp(smb2.SPNEGOAcceptCompleted, nil)
 	respBody := smb2.EncodeSessionSetupResponse(smb2.SessionSetupResponse{

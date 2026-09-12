@@ -41,6 +41,19 @@ func DecodeSessionSetupRequest(body []byte) (SessionSetupRequest, error) {
 	return r, nil
 }
 
+// SessionFlags values for the SESSION_SETUP response (MS-SMB2 §2.2.6).
+const (
+	// SessionFlagIsGuest marks the session as an unauthenticated guest.
+	SessionFlagIsGuest uint16 = 0x0001
+	// SessionFlagIsNull marks an anonymous (null) session.
+	SessionFlagIsNull uint16 = 0x0002
+	// SessionFlagEncryptData instructs the client to encrypt every message it
+	// sends on this session from now on. A server that requires encryption but
+	// never sets this bit gets cleartext requests forever — the client has no
+	// other way to learn the policy.
+	SessionFlagEncryptData uint16 = 0x0004
+)
+
 // SessionSetupResponse is the encoder input.
 type SessionSetupResponse struct {
 	SessionFlags   uint16
