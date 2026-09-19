@@ -1,0 +1,25 @@
+[server]
+listen = ":445"
+mdns = true
+encryption = "required"
+signing = "required"
+durable_timeout = "60s"
+per_user_privdrop = false
+
+[log]
+level = "info"
+format = "text"
+
+[[share]]
+name = "Backups"
+path = "/srv/backups"
+time_machine = true
+read_only = false
+guest_ok = false
+
+[[user]]
+name = "timemachine"
+# Replace with the 32-character result of `gosamba hash` before starting.
+nt_hash = "REPLACE_WITH_YOUR_NT_HASH"
+allow_shares = ["Backups"]
+# Omit system_user: the container serves files as its own UID, in one process.

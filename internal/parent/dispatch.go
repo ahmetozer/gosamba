@@ -533,8 +533,8 @@ func (d *Dispatcher) Dispatch(rw io.ReadWriter, hdr smb2.Header, body, frame []b
 		// MS-SMB2 §3.3.5.22 lists STATUS_INVALID_OPLOCK_PROTOCOL,
 		// STATUS_INVALID_PARAMETER and STATUS_FILE_CLOSED as the failures for a
 		// break the server cannot match; STATUS_NOT_SUPPORTED is not among
-		// them. We grant no oplocks or leases, so no acknowledgement can ever
-		// match one.
+		// them. Our R -> NONE notifications never request an ACK, and we
+		// grant no H/W lease or traditional oplock needing acknowledgement.
 		d.respondError(rw, hdr, smb2.StatusInvalidOplockProtocol, sess)
 		return true
 	default:
@@ -961,6 +961,12 @@ func (d *Dispatcher) handleCreate(rw io.ReadWriter, hdr smb2.Header, body []byte
 	// (DH2C/DHnC) short-circuits the normal CREATE path: we reclaim the saved
 	// Open and re-open its backing file rather than re-running disposition.
 	durReq, durRec, leaseReq := parseDurableContexts(req.CreateContexts)
+	breakLeaseReq := leaseReq
+	if req.RequestedOplock != 0xff && !durRec.present {
+		breakLeaseReq = leaseRequest{}
+	}
+	finishLeaseCreate := sharedReadLeases.beginCreate(d.Conn, breakLeaseReq)
+	defer finishLeaseCreate()
 	if durRec.present && tree.Share.Path != "" {
 		if d.handleDurableReconnect(rw, hdr, sess, tree, durRec, leaseReq) {
 			return true
@@ -1508,6 +1514,7 @@ func (d *Dispatcher) handleCreate(rw io.ReadWriter, hdr smb2.Header, body []byte
 	// Register a durable handle and collect the extra response contexts
 	// (DH2Q/DHnQ echo, RqLs lease grant) to append to the AAPL/MxAc/QFid set.
 	respCtxs := buildCreateResponseContexts(req.CreateContexts, d.Conn, tree, granted, diskFileID, volumeID)
+	open.WriteThrough = req.CreateOptions&smb2.CreateOptWriteThrough != 0
 	respCtxs = d.applyDurableAndLease(open, durReq, leaseReq, respCtxs, sess.User.Name)
 
 	resp := smb2.EncodeCreateResponse(smb2.CreateResponse{
@@ -1522,7 +1529,8 @@ func (d *Dispatcher) handleCreate(rw io.ReadWriter, hdr smb2.Header, body []byte
 		FileID:         open.FileID,
 		CreateContexts: respCtxs,
 	})
-	d.respondSuccess(rw, hdr, sess, resp)
+	finishLeaseCreate()
+	d.emitLeaseCreate(rw, hdr, sess, resp, open, leaseReq, req.RequestedOplock)
 	return true
 }
 
@@ -1577,7 +1585,7 @@ func statusFromErr(err error) smb2.Status {
 	switch {
 	// ENOSPC/EDQUOT/EFBIG all mean "the write cannot be stored". Reporting
 	// DISK_FULL lets the client tell the user why instead of retrying.
-	case errors.Is(err, syscall.ENOSPC), errors.Is(err, syscall.EDQUOT), errors.Is(err, syscall.EFBIG):
+	case errors.Is(err, syscall.ENOSPC), errors.Is(err, syscall.EDQUOT), errors.Is(err, syscall.EFBIG), errors.Is(err, syscall.E2BIG):
 		return smb2.StatusDiskFull
 	case errors.Is(err, syscall.ENOTEMPTY):
 		return smb2.StatusDirectoryNotEmpty
@@ -1860,6 +1868,12 @@ func (d *Dispatcher) handleWrite(rw io.ReadWriter, hdr smb2.Header, body []byte,
 		}
 		copy(open.streamBuf[off:end], req.Data)
 		open.streamWritten = true
+		if req.Flags&smb2.WriteFlagWriteThrough != 0 || open.WriteThrough {
+			if err := flushOpen(open); err != nil {
+				d.respondError(rw, hdr, statusFromErr(err), sess)
+				return true
+			}
+		}
 		d.respondSuccess(rw, hdr, sess, smb2.EncodeWriteResponse(smb2.WriteResponse{Count: uint32(len(req.Data))}))
 		return true
 	}
@@ -1890,6 +1904,12 @@ func (d *Dispatcher) handleWrite(rw io.ReadWriter, hdr smb2.Header, body []byte,
 		d.respondError(rw, hdr, statusFromErr(err), sess)
 		return true
 	}
+	if req.Flags&smb2.WriteFlagWriteThrough != 0 || open.WriteThrough {
+		if err := flushOpen(open); err != nil {
+			d.respondError(rw, hdr, statusFromErr(err), sess)
+			return true
+		}
+	}
 	d.respondSuccess(rw, hdr, sess, smb2.EncodeWriteResponse(smb2.WriteResponse{Count: uint32(n)}))
 	return true
 }
@@ -1907,8 +1927,9 @@ func (d *Dispatcher) handleFlush(rw io.ReadWriter, hdr smb2.Header, body []byte,
 		d.respondError(rw, hdr, smb2.StatusInvalidParameter, sess)
 		return true
 	}
-	if open.File != nil {
-		_ = open.File.Sync()
+	if err := flushOpen(open); err != nil {
+		d.respondError(rw, hdr, statusFromErr(err), sess)
+		return true
 	}
 	d.respondSuccess(rw, hdr, sess, smb2.EncodeFlushResponse())
 	return true
@@ -1954,6 +1975,7 @@ func (d *Dispatcher) handleSetInfo(rw io.ReadWriter, hdr smb2.Header, body []byt
 				d.respondError(rw, hdr, smb2.StatusDiskFull, sess)
 				return true
 			}
+			open.streamWritten = true
 			size := int(wire)
 			switch {
 			case size <= 0:

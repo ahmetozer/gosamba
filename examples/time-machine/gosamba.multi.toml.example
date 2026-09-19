@@ -1,0 +1,42 @@
+# Example: two Macs, each with its own backup share and SMB account.
+# Rename the shares, directories and users to suit your setup.
+[server]
+listen = ":445"
+mdns = true
+encryption = "required"
+signing = "required"
+durable_timeout = "60s"
+per_user_privdrop = false
+
+[log]
+level = "info"
+format = "text"
+
+# Repeat [[share]] literally; name is the SMB share name shown to clients.
+# Paths are inside the container, under the Compose mount at /srv/backups.
+[[share]]
+name = "TimeMachineLaptop"
+path = "/srv/backups/laptop"
+time_machine = true
+read_only = false
+guest_ok = false
+
+[[share]]
+name = "TimeMachineDesktop"
+path = "/srv/backups/desktop"
+time_machine = true
+read_only = false
+guest_ok = false
+
+# Generate each account's NT hash with `gosamba hash` before starting.
+# allow_shares contains the name values above, not directory paths.
+# Omit system_user so all connections are served in one process.
+[[user]]
+name = "tm_laptop"
+nt_hash = "REPLACE_WITH_LAPTOP_NT_HASH"
+allow_shares = ["TimeMachineLaptop"]
+
+[[user]]
+name = "tm_desktop"
+nt_hash = "REPLACE_WITH_DESKTOP_NT_HASH"
+allow_shares = ["TimeMachineDesktop"]

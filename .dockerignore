@@ -3,4 +3,5 @@
 .claude
 *.md
 gosamba
+gosamba.toml
 dist

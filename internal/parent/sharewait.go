@@ -8,7 +8,7 @@ import "time"
 // answered STATUS_SHARING_VIOLATION, and gosamba does. What it has no way to
 // do is make the conflicting handle go away: ksmbd clears the same conflict by
 // breaking the holder's oplock (fs/smb/server/oplock.c, smb_grant_oplock), and
-// gosamba grants neither oplocks nor leases, so a conflict it refuses is a
+// gosamba grants no handle-caching lease, so a conflict it refuses is a
 // conflict it never revisits.
 //
 // That matters because of how macOS deletes. smbfs opens the victim deny-all

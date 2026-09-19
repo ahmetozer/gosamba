@@ -29,8 +29,8 @@ watch very large trees and want the cap to scale with it.
 - **Durable handles** — opens survive a dropped TCP connection and can be
   reclaimed after reconnect.
 - **Byte-range locking and change-notify** for correct multi-client access.
-  (Leases are negotiated but granted as `LEASE_NONE`: the server implements no
-  lease-break, so it never promises a client a cache it cannot revoke.)
+  Time Machine shares can grant read leases with R → NONE break notifications.
+  Write, handle and directory caching leases are not granted.
 - **Apple client support** — AAPL create-context extensions and a synthesized
   `AFP_AfpInfo` stream so macOS Finder and the iOS Files app work smoothly.
 - **Extended attributes & alternate data streams.**
@@ -44,6 +44,176 @@ watch very large trees and want the cap to scale with it.
 - **Zero-config discovery** — advertises the service over mDNS/Bonjour so Apple
   clients find it automatically.
 - **Flexible config** — command-line flags, a TOML file, or both.
+
+## Time Machine
+
+Add a dedicated writable backup share to the TOML configuration:
+
+```toml
+[[share]]
+name = "Backups"
+path = "/srv/backups"
+time_machine = true
+```
+
+For multiple shares, repeat the literal `[[share]]` header and give each a
+different `name`. Do not use a share name as a table header such as
+`[[TimeMachineLaptop]]`. `allow_shares` refers to the `name` values.
+
+With mDNS enabled (the default), gosamba advertises `_smb._tcp` and
+`_adisk._tcp`. Only shares marked `time_machine = true` appear in the `dkN`
+TXT entries. Share names containing commas or equals signs, or exceeding the
+DNS TXT limit, are rejected. In macOS, select the share in System Settings →
+General → Time Machine → Add Backup Disk and authenticate with a configured
+SMB user. That user's `allow_shares` must include this share.
+
+FLUSH and WRITE_THROUGH report storage errors, including failed stream/xattr
+writes. Linux uses `fsync`; macOS uses `F_FULLFSYNC`. The backing filesystem
+must support user extended attributes for Apple metadata streams.
+
+Read leases are enabled only for these dedicated backup shares. They require
+all access to the backup files to go through this gosamba process: do not modify
+them locally or export the same directory through another server. This server
+has no kernel lease mechanism for external writers. A lease is granted only
+when the inode has no opens from another lease; other CREATE requests
+conservatively break cached reads before opening or overwriting files. This
+also protects hard-link aliases, at the cost of more cache invalidations than
+a full per-file lease manager. Durable reconnect retains lease state; a
+read lease broken while its client was disconnected forces a fresh open.
+
+Time Machine requires a positive `durable_timeout` and in-process serving.
+Configurations that select per-user worker processes are rejected for these
+shares because workers cannot coordinate leases or durable reconnects. mDNS
+currently uses IPv4 multicast, so clients need access to the same multicast
+network (or a Bonjour gateway).
+
+After deployment, verify a complete backup, an incremental backup after
+reconnecting, and restoration of files on an actual Mac. Protocol tests do not
+replace this end-to-end Time Machine check.
+
+### Time Machine with Docker Compose
+
+The repository includes [docker-compose.yml](docker-compose.yml) and a
+[configuration template](examples/time-machine/gosamba.toml.example) for a
+regular, rootful Docker Engine on Linux. The image is built from this checkout,
+so it includes the Time Machine implementation above.
+
+Use Docker Compose 2.27.1 or newer. Build steps also use the host network through
+[`build.network` and `build.entitlements`](https://docs.docker.com/reference/compose-file/build/),
+so downloading Go modules does not depend on the Docker bridge's DNS/NAT setup.
+The service's `network_mode` alone would not configure the build network.
+With a custom BuildKit builder, that builder must allow `network.host` as well.
+
+The service uses [host networking](https://docs.docker.com/engine/network/drivers/host/)
+for LAN Bonjour multicast and SMB. TCP port 445 must be available on the host;
+allow TCP 445 and mDNS UDP 5353 on the trusted LAN in the host firewall.
+The Mac must be able to reach IPv4 multicast on that LAN. No `ports:` mapping
+is needed with host networking.
+
+Run these commands from the repository root:
+
+```sh
+docker compose build
+install -m 600 examples/time-machine/gosamba.toml.example gosamba.toml
+sudo install -d -m 700 -o root -g root /srv/timemachine
+```
+
+If `go mod download` fails with `lookup proxy.golang.org: i/o timeout`, check
+DNS and HTTPS access on the Linux host:
+
+```sh
+getent ahosts proxy.golang.org
+curl -I --connect-timeout 10 https://proxy.golang.org/
+```
+
+If these fail too, fix the host's DNS/network access first; using host networking
+cannot bypass an outage on the host itself. Then retry `docker compose build`.
+
+Generate the password hash without putting the password in shell history
+(the following commands use Bash):
+
+```bash
+read -r -s -p 'SMB password: ' tm_password
+printf '\n'
+printf '%s\n' "$tm_password" | docker run --rm -i --network none gosamba:time-machine hash
+unset tm_password
+```
+
+Replace `REPLACE_WITH_YOUR_NT_HASH` in `gosamba.toml` with the printed hash.
+The placeholder deliberately prevents startup until a password is configured.
+Keep the config private and start the service. It can remain owned by the host
+user who created it:
+
+```sh
+sudo chmod 600 gosamba.toml
+docker compose config --quiet
+docker compose up -d
+docker compose logs -f timemachine
+```
+
+The container runs as UID/GID `0:0` with `NET_BIND_SERVICE` and `DAC_OVERRIDE`,
+a read-only root filesystem and a writable backup mount. `DAC_OVERRIDE` lets
+the process read a host-user-owned `0600` config despite `cap_drop: ALL`;
+the config mount remains read-only. These capabilities are described in the
+[Docker runtime reference](https://docs.docker.com/engine/containers/run/).
+Files in `/srv/timemachine` are owned by root. Do not add `system_user` or enable `per_user_privdrop`: Time
+Machine needs one server process for lease coordination and durable reconnects.
+The local `gosamba.toml` is excluded from Git and the Docker build context.
+
+The application accepts a private config such as `0600` or `0640`; `0644`
+and `0664` are rejected because other users can read the NT password hash.
+If you used an earlier version of this Compose example, recreate the container
+after updating capabilities (a restart alone does not apply them):
+
+```sh
+sudo chmod 600 gosamba.toml
+docker compose up -d --force-recreate timemachine
+```
+
+If reading still fails, check the actual host mode and numeric ownership with
+`stat -Lc 'mode=%a uid=%u gid=%g %n' gosamba.toml` and confirm the config bind
+source with `docker compose config`. This example assumes rootful Docker without
+user-namespace remapping. `DAC_OVERRIDE` does not bypass SELinux or permissions
+enforced by a remote filesystem such as NFS with root squashing.
+
+Optional settings can be placed in a `.env` file alongside `docker-compose.yml`:
+
+```dotenv
+TIME_MACHINE_HOSTNAME=backup-nas
+TIME_MACHINE_PATH=/mnt/backups/timemachine
+```
+
+Create the selected directory beforehand with the same ownership and permissions
+as above, on a filesystem with extended-attribute support. The container path
+in `gosamba.toml` stays `/srv/backups`. Use a unique hostname on your LAN.
+The bind mounts require existing paths; a missing backup directory or config will
+not silently become an empty Docker-created directory.
+
+On the Mac, select **Backups** in Time Machine and log in as **timemachine**
+with the password used to generate the hash. To check SMB access manually,
+connect to `smb://backup-nas.local/Backups` (or the Linux server's LAN IP;
+the default hostname is `gosamba-timemachine`). Backup data remains on the host
+when the container is recreated. A container restart drops in-memory durable
+handles, so the Mac reconnects with fresh file opens.
+
+For multiple Macs, use the
+[multi-share template](examples/time-machine/gosamba.multi.toml.example).
+It defines `TimeMachineLaptop` and `TimeMachineDesktop`, with a separate SMB
+account for each: `tm_laptop` and `tm_desktop`. Each account can access only its
+own share. Adapt the names and replace both NT hash placeholders before use.
+Both directories are inside the existing `/srv/backups` container mount,
+so no additional Compose volumes are needed. For the default host path, create
+them with:
+
+```sh
+sudo install -d -m 700 -o root -g root \
+  /srv/timemachine/laptop /srv/timemachine/desktop
+```
+
+If you changed `TIME_MACHINE_PATH`, create these subdirectories there instead.
+After updating `gosamba.toml`, recreate the container with
+`docker compose up -d --force-recreate timemachine`. The startup log should show
+`shares=2 users=2`. Paths in the TOML file are container paths, not host paths.
 
 ## Build
 

@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -251,5 +252,27 @@ func TestDecodeTOML_EmptyKeyErrors(t *testing.T) {
 	var f File
 	if err := decodeTOMLFile(p, &f); err == nil {
 		t.Fatal("expected error for empty key before '=', got nil")
+	}
+}
+
+func TestParseFileRejectsUnknownTableHeaders(t *testing.T) {
+	for _, header := range []string{
+		"[[TimeMachineLaptop]]", "[[TimeMachineDesktop]]", "[[Backups]]",
+		"[[shares]]", "[[users]]", "[[server]]", "[share]", "[user]", "[sever]",
+	} {
+		t.Run(header, func(t *testing.T) {
+			// A typo after a valid table must also fail, rather than silently
+			// discarding the remainder or applying it to the preceding table.
+			path := writeTOMLTemp(t, "[server]\nmdns = true\n"+header+"\nname = \"Backups\"\n")
+			_, err := ParseFile(path)
+			if err == nil {
+				t.Fatal("unknown table was silently ignored")
+			}
+			for _, want := range []string{"line 3", header, "[[share]]"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q does not contain %q", err, want)
+				}
+			}
+		})
 	}
 }

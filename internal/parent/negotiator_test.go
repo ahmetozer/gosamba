@@ -80,6 +80,9 @@ func TestNegotiate_HappyPath(t *testing.T) {
 	if conn.Selection.Dialect != smb2.Dialect311 {
 		t.Errorf("dialect: %x", conn.Selection.Dialect)
 	}
+	if conn.NegotiatedCapabilities&smb2.CapLeasing == 0 {
+		t.Fatal("SMB 3.1.1 must advertise file leasing")
+	}
 	if conn.Selection.Cipher != smb2.CipherAES256GCM {
 		t.Errorf("cipher: %x", conn.Selection.Cipher)
 	}

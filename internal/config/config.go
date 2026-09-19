@@ -60,10 +60,11 @@ type LogConfig struct {
 }
 
 type ShareConfig struct {
-	Name     string
-	Path     string
-	ReadOnly bool
-	GuestOK  bool
+	Name        string
+	Path        string
+	ReadOnly    bool
+	GuestOK     bool
+	TimeMachine bool
 }
 
 type UserConfig struct {

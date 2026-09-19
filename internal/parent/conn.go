@@ -244,6 +244,7 @@ func releaseConnOpens(sessions *SessionTable, durable *DurableTable) {
 		}
 		if o.IsDurable && durable != nil &&
 			durable.Has(o.DurableClientGuid, o.DurableCreateGuid) {
+			o.leaseDisconnected.Store(true)
 			durable.Detach(o.DurableClientGuid, o.DurableCreateGuid)
 			unlock()
 			continue

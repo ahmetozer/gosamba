@@ -27,7 +27,8 @@ const (
 //   - key = true | false
 //   - key = ["a", "b", ...] string arrays
 //
-// Unknown keys are silently ignored (matches BurntSushi default), with one
+// Unknown table headers are rejected: silently ignoring a misspelled [[share]]
+// can otherwise start a server with no shares. Unknown keys are ignored, with one
 // deliberate exception: an unknown key inside a [[user]] table is an error,
 // because a misspelled key there fails open rather than merely being ignored
 // (see applyUserKV).
@@ -68,8 +69,7 @@ func decodeTOMLFile(path string, f *File) error {
 				f.Users = append(f.Users, FileUser{})
 				cur = secUser
 			default:
-				// unknown array-of-tables: ignore entries until next header
-				cur = secRoot
+				return fmt.Errorf("line %d: unknown array-of-tables [[%s]]; use [[share]] or [[user]]; put the share's name in its name field", lineNum, name)
 			}
 			continue
 		}
@@ -86,7 +86,7 @@ func decodeTOMLFile(path string, f *File) error {
 			case "log":
 				cur = secLog
 			default:
-				cur = secRoot
+				return fmt.Errorf("line %d: unknown table [%s]; supported headers are [server], [log], [[share]] and [[user]]", lineNum, name)
 			}
 			continue
 		}
@@ -245,6 +245,12 @@ func applyShareKV(sh *FileShare, key, valStr string, lineNum int) error {
 			return err
 		}
 		sh.ReadOnly = b
+	case "time_machine":
+		b, err := parseBool(valStr, lineNum)
+		if err != nil {
+			return err
+		}
+		sh.TimeMachine = b
 	case "guest_ok":
 		b, err := parseBool(valStr, lineNum)
 		if err != nil {

@@ -81,6 +81,18 @@ func Validate(cfg *Config) error {
 		if s.Name == "" {
 			return fmt.Errorf("share[%d]: name is empty", i)
 		}
+		if s.TimeMachine {
+			if cfg.Server.DurableTimeout <= 0 {
+				return fmt.Errorf("share %q: time_machine requires a positive durable_timeout", s.Name)
+			}
+			if s.ReadOnly {
+				return fmt.Errorf("share %q: time_machine requires a writable share", s.Name)
+			}
+			// adisk uses comma-separated fields inside one DNS TXT string.
+			if strings.ContainsAny(s.Name, ",=\x00") || len(fmt.Sprintf("dk%d=adVN=%s,adVF=0x82", len(cfg.Shares)-1, s.Name)) > 255 {
+				return fmt.Errorf("share %q: name cannot be represented in an adisk TXT record", s.Name)
+			}
+		}
 		key := strings.ToLower(s.Name)
 		if _, dup := seenShares[key]; dup {
 			return fmt.Errorf("share %q: duplicate name (share names are matched case-insensitively)", s.Name)

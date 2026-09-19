@@ -32,10 +32,11 @@ type FileLog struct {
 }
 
 type FileShare struct {
-	Name     string `toml:"name"`
-	Path     string `toml:"path"`
-	ReadOnly bool   `toml:"read_only"`
-	GuestOK  bool   `toml:"guest_ok"`
+	Name        string `toml:"name"`
+	Path        string `toml:"path"`
+	ReadOnly    bool   `toml:"read_only"`
+	GuestOK     bool   `toml:"guest_ok"`
+	TimeMachine bool   `toml:"time_machine"`
 }
 
 type FileUser struct {

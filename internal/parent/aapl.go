@@ -64,8 +64,8 @@ const (
 	// one is lost when the other flushes.
 	aaplVolCaseSensitive = 2
 	// FULL_SYNC asserts the server honors F_FULLFSYNC semantics. We answer
-	// FLUSH with file.Sync() which is the strongest durability POSIX exposes
-	// on Linux ext4/xfs, so the claim is honest. (We do NOT advertise
+	// FLUSH with fsync on Linux and F_FULLFSYNC on macOS, propagating
+	// failures to the client. (We do NOT advertise
 	// SUPPORT_RESOLVE_ID — pairing that bit with our decline-by-default
 	// RESOLVE_ID handler made iPad and macOS Finder break the mount on first
 	// CREATE; revisit only with a real inverse-lookup implementation.)

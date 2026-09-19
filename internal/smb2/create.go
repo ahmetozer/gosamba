@@ -50,6 +50,7 @@ const (
 // CreateOptions bits.
 const (
 	CreateOptDirectoryFile uint32 = 0x00000001
+	CreateOptWriteThrough  uint32 = 0x00000002
 	CreateOptNonDirFile    uint32 = 0x00000040
 	CreateOptDeleteOnClose uint32 = 0x00001000
 )

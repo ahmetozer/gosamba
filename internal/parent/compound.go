@@ -36,6 +36,7 @@ type pendingMsg struct {
 	buf     []byte
 	sess    *Session
 	encrypt bool
+	lease   *leaseCandidate
 }
 
 // emit hands one finished response to this frame's chain buffer.
@@ -94,6 +95,16 @@ func (d *Dispatcher) flush(rw io.Writer) {
 // compounded frame, not each member, and a signature under it would be
 // redundant (MS-SMB2 §3.3.4.1.4), so encrypted members are not signed.
 func (d *Dispatcher) sendCompound(rw io.Writer, msgs []pendingMsg) {
+	for _, msg := range msgs {
+		if msg.lease != nil {
+			sharedReadLeases.mu.Lock()
+			defer sharedReadLeases.mu.Unlock()
+			for i := range msgs {
+				sharedReadLeases.grantLocked(msgs[i].lease, msgs[i].buf)
+			}
+			break
+		}
+	}
 	sess, encrypt := msgs[0].sess, msgs[0].encrypt
 	if len(msgs) == 1 {
 		_ = d.sealAndSend(rw, sess, msgs[0].buf, encrypt)
