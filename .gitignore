@@ -1,4 +1,5 @@
 /gosamba
+/gosamba.toml
 /dist/
 *.test
 *.out

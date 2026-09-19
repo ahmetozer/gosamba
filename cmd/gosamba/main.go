@@ -163,6 +163,13 @@ func run(args []string) error {
 		usePrivdrop = false
 	}
 	if usePrivdrop {
+		for _, share := range cfg.Shares {
+			if share.TimeMachine {
+				return fmt.Errorf("share %q: time_machine requires in-process serving; per-user workers cannot coordinate leases or durable reconnects", share.Name)
+			}
+		}
+	}
+	if usePrivdrop {
 		log.Warn("durable handle reclaim is disabled under --per-user-privdrop (each connection runs in its own worker process); clients will re-open handles after reconnect")
 	}
 
@@ -185,16 +192,20 @@ func run(args []string) error {
 
 	// mDNS/Bonjour: advertise the SMB service so Apple clients auto-discover it.
 	if cfg.Server.MDNS && !parent.IsWorker() {
-		host, port, err := net.SplitHostPort(ln.Addr().String())
+		_, port, err := net.SplitHostPort(ln.Addr().String())
 		if err == nil {
 			var portNum int
 			fmt.Sscanf(port, "%d", &portNum)
 			instance, _ := os.Hostname()
-			if host == "" || host == "0.0.0.0" {
-				h, _ := os.Hostname()
-				host = h
+			// DNS-SD SRV targets are hostnames even when bound to an IP address.
+			host := strings.TrimSuffix(instance, ".local")
+			var backupShares []string
+			for _, share := range cfg.Shares {
+				if share.TimeMachine {
+					backupShares = append(backupShares, share.Name)
+				}
 			}
-			mdnsCloser, mdnsErr := discovery.Advertise(ctx, instance, host, portNum, log)
+			mdnsCloser, mdnsErr := discovery.Advertise(ctx, instance, host, portNum, log, discovery.Options{TimeMachineShares: backupShares})
 			if mdnsErr != nil {
 				log.Debug("mDNS advertise failed (continuing without it)", "err", mdnsErr)
 			} else {

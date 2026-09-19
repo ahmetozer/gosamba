@@ -36,6 +36,11 @@ type Open struct {
 	File          *os.File // nil for dirs and streams
 	Tree          *Tree
 	DeleteOnClose bool
+	WriteThrough  bool
+
+	// Atomic because lease breaks run on other connections without open.mu.
+	leaseDisconnected atomic.Bool
+	leaseRevoked      atomic.Bool
 
 	// LinkPath is the in-share symlink this CREATE traversed to reach Path,
 	// and is EMPTY on every handle that did not traverse one.

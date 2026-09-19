@@ -40,7 +40,7 @@ var (
 // when the intent was HANDLE_CACHING makes macOS clear its write-immediately
 // flag and enable unsafe write-behind caching.
 //
-// We currently only ever grant leaseNone (see applyDurableAndLease), but the
+// Read leases are granted by readlease.go; the
 // values must be right so that any future grant means what it says.
 const (
 	leaseNone          uint32 = 0x00
@@ -80,6 +80,7 @@ type leaseRequest struct {
 	v2      bool // true when the request arrived in the 52-byte v2 form
 	key     [16]byte
 	state   uint32
+	epoch   uint16
 }
 
 // parseDurableContexts walks the raw create-context blob and extracts any
@@ -127,11 +128,14 @@ func parseDurableContexts(raw []byte) (durableRequest, durableReconnect, leaseRe
 			// v2 (52 bytes): ... plus ParentLeaseKey(16) Epoch(2) Reserved(2)
 			// The length is the only discriminator; record it so the response
 			// goes back in the same form (MS-SMB2 §2.2.13.2.8 / §2.2.13.2.10).
-			if len(c.Data) >= 20 {
+			if len(c.Data) == rqLsV1Size || len(c.Data) == rqLsV2Size {
 				lr.present = true
 				lr.v2 = len(c.Data) >= rqLsV2Size
 				copy(lr.key[:], c.Data[0:16])
 				lr.state = binary.LittleEndian.Uint32(c.Data[16:])
+				if lr.v2 {
+					lr.epoch = binary.LittleEndian.Uint16(c.Data[48:])
+				}
 			}
 		}
 		return true
@@ -181,7 +185,7 @@ const (
 //	v2 (MS-SMB2 §2.2.14.2.11, 52 bytes):
 //	    ... + ParentLeaseKey(16) Epoch(2) Reserved(2)
 //
-// Because we only ever grant LEASE_NONE, the v2 tail is all zeroes: no parent
+// The default v2 tail is zero; readlease.go sets the epoch on grants. No parent
 // lease key is echoed and SMB2_LEASE_FLAG_PARENT_LEASE_KEY_SET stays clear, so
 // a client will not compare the (absent) parent key, and Epoch 0 is correct for
 // a lease that was never established.
@@ -542,6 +546,10 @@ func (d *Dispatcher) handleDurableReconnect(rw io.ReadWriter, hdr smb2.Header, s
 	if !ok {
 		return false
 	}
+	if saved.leaseRevoked.Load() {
+		releaseOpen(saved)
+		return false
+	}
 	// reclaimForReconnect above already enforced all three MS-SMB2 §3.3.5.9.7
 	// preconditions — same share, same user, and the owning connection gone —
 	// so saved is non-nil only for a legitimate reconnect.
@@ -581,6 +589,7 @@ func (d *Dispatcher) handleDurableReconnect(rw io.ReadWriter, hdr smb2.Header, s
 	open := &Open{
 		FileID:            saved.FileID,
 		Path:              saved.Path,
+		WriteThrough:      saved.WriteThrough,
 		LinkPath:          saved.LinkPath,
 		IsDir:             saved.IsDir,
 		Tree:              tree,
@@ -623,6 +632,12 @@ func (d *Dispatcher) handleDurableReconnect(rw io.ReadWriter, hdr smb2.Header, s
 	// share-mode reservation onto the replacement rather than releasing and
 	// re-acquiring it: a transfer never gives up the slot, so no other client
 	// can slip a conflicting deny mode in, and no duplicate entry is created.
+	if !sharedReadLeases.reconnect(saved, open, d, sess, lr) {
+		if open.File != nil {
+			open.File.Close()
+		}
+		return false
+	}
 	sharedShareModes.transfer(saved, open)
 	reclaimed = true
 
@@ -698,11 +713,8 @@ func (d *Dispatcher) handleDurableReconnect(rw io.ReadWriter, hdr smb2.Header, s
 	var echo []smb2.CreateContext
 	if rec.v2 {
 		if lr.present {
-			// Grant LEASE_NONE, exactly as the fresh-CREATE path does (see
-			// applyDurableAndLease): we implement no lease-break machinery, so
-			// any caching grant would let the client serve stale data. The
-			// lease key is the client's own, from the RqLs it sent with this
-			// reconnect, and the v1/v2 form matches what it asked with.
+			// Start at NONE; emitLeaseCreate fills the existing lease state
+			// and epoch just before this response is queued.
 			echo = append(echo, smb2.CreateContext{
 				Name: tagRqLs,
 				Data: encodeRqLsResponse(lr.key, leaseNone, lr.v2),
@@ -716,6 +728,9 @@ func (d *Dispatcher) handleDurableReconnect(rw io.ReadWriter, hdr smb2.Header, s
 		// reintroduce exactly the context the section refuses to construct.
 	} else {
 		echo = append(echo, smb2.CreateContext{Name: tagDHnQ, Data: encodeDHnQResponse()})
+		if lr.present {
+			echo = append(echo, smb2.CreateContext{Name: tagRqLs, Data: encodeRqLsResponse(lr.key, leaseNone, lr.v2)})
+		}
 	}
 
 	resp := smb2.EncodeCreateResponse(smb2.CreateResponse{
@@ -730,7 +745,7 @@ func (d *Dispatcher) handleDurableReconnect(rw io.ReadWriter, hdr smb2.Header, s
 		FileID:         open.FileID,
 		CreateContexts: smb2.EncodeCreateContexts(echo),
 	})
-	d.respondSuccess(rw, hdr, sess, resp)
+	d.emitLeaseCreate(rw, hdr, sess, resp, open, lr, 0xff)
 	return true
 }
 
@@ -795,14 +810,8 @@ func (d *Dispatcher) applyDurableAndLease(open *Open, dq durableRequest, lr leas
 	}
 
 	if lr.present {
-		// Grant NO caching (LEASE_NONE). A read-caching lease is a promise that
-		// the server will send a lease break before the file changes under the
-		// client; we implement no lease-break machinery (OPLOCK_BREAK is
-		// answered STATUS_INVALID_OPLOCK_PROTOCOL and nothing ever sends an
-		// unsolicited break), so a client that trusted a read lease would keep serving
-		// stale data indefinitely whenever another opener — or a process on the
-		// server itself — modified the file. Echoing LEASE_NONE keeps the
-		// client re-reading from the server, which is always correct.
+		// Start without caching. emitLeaseCreate grants R only when it can
+		// register the lease atomically with queueing the CREATE response.
 		ctxs = append(ctxs, smb2.CreateContext{
 			Name: tagRqLs,
 			Data: encodeRqLsResponse(lr.key, leaseNone, lr.v2),

@@ -314,6 +314,11 @@ func (t *shareModeTable) acquireLocked(key fileKey, o *Open, desired, share uint
 // release drops o's reservation. It is idempotent and safe on a handle that
 // never had one, so every disposal path can call it unconditionally.
 func (t *shareModeTable) release(o *Open) {
+	// Use the same lock order as lease publication so a compound CREATE
+	// cannot grant a lease between removing its lease and its reservation.
+	sharedReadLeases.mu.Lock()
+	defer sharedReadLeases.mu.Unlock()
+	sharedReadLeases.removeLocked(o)
 	if o == nil {
 		return
 	}

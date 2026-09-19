@@ -5,6 +5,9 @@ import (
 	"fmt"
 )
 
+// WriteFlagWriteThrough requests stable storage before acknowledging the write.
+const WriteFlagWriteThrough uint32 = 0x00000001
+
 type WriteRequest struct {
 	Length uint32
 	Offset uint64

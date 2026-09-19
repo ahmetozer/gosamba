@@ -98,10 +98,11 @@ func Merge(cli CLI, file File) (Config, error) {
 			name = filepath.Base(fs.Path)
 		}
 		cfg.Shares = append(cfg.Shares, ShareConfig{
-			Name:     name,
-			Path:     fs.Path,
-			ReadOnly: fs.ReadOnly,
-			GuestOK:  fs.GuestOK,
+			Name:        name,
+			Path:        fs.Path,
+			ReadOnly:    fs.ReadOnly,
+			GuestOK:     fs.GuestOK,
+			TimeMachine: fs.TimeMachine,
 		})
 	}
 	for _, cs := range cli.Shares {

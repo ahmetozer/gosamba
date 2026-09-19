@@ -196,8 +196,10 @@ func (d *Dispatcher) handleCreateNamedStream(rw io.ReadWriter, hdr smb2.Header, 
 		Path:          osPath,
 		Tree:          tree,
 		IsStream:      true,
+		WriteThrough:  req.CreateOptions&smb2.CreateOptWriteThrough != 0,
 		StreamName:    streamName,
 		GrantedAccess: maxAccess,
+		streamWritten: createAction == smb2.CreateActionCreated,
 	}
 	// Load any previously persisted stream content so READ returns it. A stream
 	// that was never written (or a filesystem without xattr support) yields an

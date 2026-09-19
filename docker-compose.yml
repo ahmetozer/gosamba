@@ -1,0 +1,49 @@
+# Time Machine on a Linux host. See README.md: "Time Machine with Docker Compose".
+services:
+  timemachine:
+    build:
+      context: .
+      # Build RUN steps have their own network, separate from network_mode.
+      # Use the Linux host network for Go module downloads as well.
+      network: host
+      entitlements:
+        - network.host
+    image: gosamba:time-machine
+    hostname: ${TIME_MACHINE_HOSTNAME:-gosamba-timemachine}
+    restart: unless-stopped
+
+    # Bonjour needs multicast on the LAN. Host networking also exposes TCP 445;
+    # do not add a ports: section or run another SMB server on that port.
+    network_mode: host
+    command: ["--config", "/etc/gosamba.toml"]
+
+    # One process serves the share. No system_user/per-user privilege workers.
+    # DAC_OVERRIDE lets UID 0 read a mode-0600 config owned by the host user.
+    # The config bind mount stays read-only; the backup directory is root-owned.
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add:
+      - NET_BIND_SERVICE
+      - DAC_OVERRIDE
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+
+    volumes:
+      - type: bind
+        source: ./gosamba.toml
+        target: /etc/gosamba.toml
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${TIME_MACHINE_PATH:-/srv/timemachine}
+        target: /srv/backups
+        bind:
+          create_host_path: false
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

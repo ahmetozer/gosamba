@@ -149,6 +149,9 @@ func Negotiate(rw io.ReadWriter, opts NegotiatorOptions, log *slog.Logger) (*Con
 		secMode |= smb2.NegotiateSigningRequired
 	}
 	caps := smb2.CapLargeMTU
+	if sel.Dialect >= smb2.Dialect210 && !IsWorker() {
+		caps |= smb2.CapLeasing
+	}
 	if sel.Cipher != 0 && sel.Dialect >= smb2.Dialect300 {
 		caps |= smb2.CapEncryption
 	}
